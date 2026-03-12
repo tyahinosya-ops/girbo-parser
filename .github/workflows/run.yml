@@ -8,7 +8,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Установить зависимости
         run: pip install requests pandas beautifulsoup4 lxml tqdm
@@ -17,15 +17,7 @@ jobs:
         run: python rusprofile_parser.py
 
       - name: Шаг 2 - Проверить по ГИРБО
-        run: |
-          INN_FILE=$(ls output/inns_*.txt 2>/dev/null | head -1)
-          if [ -n "$INN_FILE" ]; then
-            echo "Найден файл ИНН: $INN_FILE"
-            python girbo_parser.py --source "$INN_FILE"
-          else
-            echo "Файл ИНН не найден — запуск через API ЕГРЮЛ"
-            python girbo_parser.py --source api
-          fi
+        run: python girbo_parser.py --source api
 
       - name: Сохранить результаты
         if: always()
