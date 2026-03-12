@@ -1,0 +1,33 @@
+name: Mining Parser
+
+on:
+  workflow_dispatch:
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установить зависимости
+        run: pip install requests pandas beautifulsoup4 lxml tqdm
+
+      - name: Шаг 1 - Собрать ИНН с Rusprofile
+        run: python rusprofile_parser.py
+
+      - name: Шаг 2 - Проверить по ГИРБО
+        run: |
+          INN_FILE=$(ls output/inns_*.txt | head -1)
+          python girbo_parser.py --source "$INN_FILE"
+
+      - name: Сохранить результаты
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: |
+            output/
+            mining_leads.csv
