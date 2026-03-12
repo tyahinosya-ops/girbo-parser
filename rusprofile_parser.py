@@ -84,7 +84,7 @@ def build_search_url(okvd: str, region: str, page: int = 1) -> str:
     
     Пример: https://www.rusprofile.ru/search?query=&okved=63.11&region=irkutskaya-oblast&page=1
     """
-    okvd_clean = okvd.replace(".", "")  # rusprofile без точки
+    okvd = okvd.replace(".", "")  # rusprofile без точки
    return (
     f"https://www.rusprofile.ru/codes/{okvd}"
     f"?region={region}&page={page}"
