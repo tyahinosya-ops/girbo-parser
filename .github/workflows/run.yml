@@ -23,7 +23,7 @@ jobs:
             echo "Найден файл ИНН: $INN_FILE"
             python girbo_parser.py --source "$INN_FILE"
           else
-            echo "Файл ИНН не найден — запуск в режиме API (ЕГРЮЛ)"
+            echo "Файл ИНН не найден — запуск через API ЕГРЮЛ"
             python girbo_parser.py --source api
           fi
 
