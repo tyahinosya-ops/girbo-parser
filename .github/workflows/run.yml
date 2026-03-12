@@ -1,14 +1,11 @@
 name: Mining Parser
-
 on:
   workflow_dispatch:
-
 jobs:
   parse:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -21,10 +18,17 @@ jobs:
 
       - name: Шаг 2 - Проверить по ГИРБО
         run: |
-          INN_FILE=$(ls output/inns_*.txt | head -1)
-          python girbo_parser.py --source "$INN_FILE"
+          INN_FILE=$(ls output/inns_*.txt 2>/dev/null | head -1)
+          if [ -n "$INN_FILE" ]; then
+            echo "Найден файл ИНН: $INN_FILE"
+            python girbo_parser.py --source "$INN_FILE"
+          else
+            echo "Файл ИНН не найден — запуск в режиме API (ЕГРЮЛ)"
+            python girbo_parser.py --source api
+          fi
 
       - name: Сохранить результаты
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: results
