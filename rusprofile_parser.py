@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import date
 logging.basicConfig(
     level=logging.INFO,
-    format="%(H:%M:%S) [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
@@ -85,10 +85,10 @@ def build_search_url(okvd: str, region: str, page: int = 1) -> str:
     Пример: https://www.rusprofile.ru/search?query=&okved=63.11&region=irkutskaya-oblast&page=1
     """
     okvd_clean = okvd.replace(".", "")  # rusprofile без точки
-    return (
-        f"https://www.rusprofile.ru/codes/{okvd_clean}"
-        f"?region={region}&page={page}"
-    )
+   return (
+    f"https://www.rusprofile.ru/codes/{okvd}"
+    f"?region={region}&page={page}"
+)
 def parse_company_list_page(html: str) -> list[dict]:
     """
     Парсит страницу со списком компаний.
