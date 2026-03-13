@@ -37,34 +37,28 @@ jobs:
         if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'mining' }}
         run: python girbo_parser.py --category mining --source api --debug
 
-      - name: Показать результаты (диагностика)
+      - name: Диагностика — вывести отчёты
         if: always()
         run: |
-          echo "=== Файлы в output/ ==="
-          ls -lah output/ || echo "output/ не найден"
-          echo ""
-          echo "=== run_report hosting ==="
-          cat output/run_report_hosting_*.txt 2>/dev/null || echo "файл не найден"
-          echo ""
-          echo "=== run_report mining ==="
-          cat output/run_report_mining_*.txt 2>/dev/null || echo "файл не найден"
-          echo ""
-          echo "=== ИНН хостинг (первые 10) ==="
-          head -10 output/inns_hosting_*.txt 2>/dev/null || echo "файл не найден"
-          echo "Строк:" $(wc -l < output/inns_hosting_*.txt 2>/dev/null || echo 0)
-          echo ""
-          echo "=== ИНН майнинг (первые 10) ==="
-          head -10 output/inns_mining_*.txt 2>/dev/null || echo "файл не найден"
-          echo "Строк:" $(wc -l < output/inns_mining_*.txt 2>/dev/null || echo 0)
-          echo ""
-          echo "=== CSV файлы ==="
-          ls -lah output/*.csv 2>/dev/null || echo "CSV не найдено"
-          echo ""
-          echo "=== Первые 5 строк CSV (hosting) ==="
-          head -5 output/mining_leads_hosting_*.csv 2>/dev/null || echo "нет CSV"
-          echo ""
-          echo "=== Первые 5 строк CSV (mining) ==="
-          head -5 output/mining_leads_mining_*.csv 2>/dev/null || echo "нет CSV"
+          echo "===FILES==="
+          ls -lah output/
+          echo "===HOSTING_REPORT==="
+          cat output/run_report_hosting_*.txt 2>/dev/null || echo "HOSTING_REPORT_NOT_FOUND"
+          echo "===MINING_REPORT==="
+          cat output/run_report_mining_*.txt 2>/dev/null || echo "MINING_REPORT_NOT_FOUND"
+          echo "===INNS_HOSTING==="
+          wc -l output/inns_hosting_*.txt 2>/dev/null && head -5 output/inns_hosting_*.txt 2>/dev/null || echo "INN_HOSTING_NOT_FOUND"
+          echo "===INNS_MINING==="
+          wc -l output/inns_mining_*.txt 2>/dev/null && head -5 output/inns_mining_*.txt 2>/dev/null || echo "INN_MINING_NOT_FOUND"
+          echo "===CSV_HOSTING==="
+          wc -l output/mining_leads_hosting_*.csv 2>/dev/null && head -3 output/mining_leads_hosting_*.csv 2>/dev/null || echo "CSV_HOSTING_NOT_FOUND"
+          echo "===CSV_MINING==="
+          wc -l output/mining_leads_mining_*.csv 2>/dev/null && head -3 output/mining_leads_mining_*.csv 2>/dev/null || echo "CSV_MINING_NOT_FOUND"
+          HOSTING_INN_COUNT=$(wc -l < output/inns_hosting_*.txt 2>/dev/null || echo 0)
+          MINING_INN_COUNT=$(wc -l < output/inns_mining_*.txt 2>/dev/null || echo 0)
+          CSV_HOST=$(wc -l < output/mining_leads_hosting_*.csv 2>/dev/null || echo 0)
+          CSV_MIN=$(wc -l < output/mining_leads_mining_*.csv 2>/dev/null || echo 0)
+          echo "::warning::ИТОГ: хостинг_ИНН=$HOSTING_INN_COUNT майнинг_ИНН=$MINING_INN_COUNT хостинг_CSV=$CSV_HOST майнинг_CSV=$CSV_MIN"
 
       - name: Сохранить результаты
         if: always()
