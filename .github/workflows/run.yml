@@ -1,29 +1,47 @@
 name: Mining Parser
 on:
   workflow_dispatch:
+    inputs:
+      category:
+        description: "Категория поиска"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - both
+          - hosting
+          - mining
+
 jobs:
   parse:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Установить зависимости
-        run: pip install requests pandas beautifulsoup4 lxml tqdm
+        run: pip install requests pandas beautifulsoup4 lxml tqdm openpyxl
 
-      - name: Шаг 1 - Собрать ИНН с Rusprofile
-        run: python rusprofile_parser.py
+      - name: Создать папку output
+        run: mkdir -p output
 
-      - name: Шаг 2 - Проверить по ГИРБО
-        run: python girbo_parser.py --source api
+      - name: Поиск хостингов и ЦОД (ОКВЭД → ЕГРЮЛ → ГИРБО)
+        if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'hosting' }}
+        run: python girbo_parser.py --category hosting --source api
+
+      - name: Поиск майнеров (Федресурс → ГИРБО)
+        if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'mining' }}
+        run: python girbo_parser.py --category mining --source api
 
       - name: Сохранить результаты
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results
-          path: |
-            output/
-            mining_leads.csv
+          name: mining-leads-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+
