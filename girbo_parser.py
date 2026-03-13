@@ -634,17 +634,12 @@ def run_parser(
         financials      = extract_key_financials(report_data)
         score, triggers = calculate_mining_score(financials, electricity)
 
-        # Пропускаем совсем нулевые записи
-        if financials["revenue"] == 0 and financials["balance_total"] == 0:
+        # Пропускаем полностью пустые записи (нет никаких данных)
+        if (financials["revenue"] == 0 and financials["balance_total"] == 0
+                and financials["fixed_assets"] == 0):
             continue
 
-        # Фильтр хостинга
-        if category == "hosting":
-            proxy_monthly = financials["cost_of_sales"] * 0.40 / 12
-            if (electricity < min_electricity
-                    and proxy_monthly < min_electricity
-                    and score < min_score):
-                continue
+        # Фильтр отключён — берём всех кто есть в ГИРБО
 
         results.append({
             "ИНН":               inn,
@@ -722,3 +717,4 @@ if __name__ == "__main__":
         output=args.output,
         min_score=args.min_score,
     )
+
