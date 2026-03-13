@@ -31,11 +31,11 @@ jobs:
 
       - name: Поиск хостингов и ЦОД (ОКВЭД → ЕГРЮЛ → ГИРБО)
         if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'hosting' }}
-        run: python girbo_parser.py --category hosting --source api
+        run: python girbo_parser.py --category hosting --source api --debug
 
       - name: Поиск майнеров (Федресурс → ГИРБО)
         if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'mining' }}
-        run: python girbo_parser.py --category mining --source api
+        run: python girbo_parser.py --category mining --source api --debug
 
       - name: Сохранить результаты
         if: always()
