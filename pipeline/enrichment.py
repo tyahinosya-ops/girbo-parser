@@ -8,7 +8,7 @@ import asyncio
 import logging
 from typing import Any
 
-from pipeline.rusprofile import fetch_rusprofile
+from pipeline.rusprofile import fetch_rusprofile_batch
 from pipeline.fedresurs import fetch_fedresurs
 from pipeline.fns import fetch_fns
 from config import ENRICHMENT_CONCURRENCY
@@ -57,53 +57,48 @@ def _merge(inn: str, rp: dict, fed: dict, fns: dict) -> dict[str, Any]:
     }
 
 
-async def enrich_one(inn: str) -> dict[str, Any]:
-    """
-    Обогащает один ИНН параллельно из всех трёх источников.
-    """
-    log.info(f"Обогащение ИНН: {inn}")
-
-    # Запускаем все три воркера одновременно
-    rp_task  = asyncio.create_task(fetch_rusprofile(inn))
-    fed_task = asyncio.create_task(fetch_fedresurs(inn))
-    fns_task = asyncio.create_task(fetch_fns(inn))
-
-    rp, fed, fns = await asyncio.gather(rp_task, fed_task, fns_task, return_exceptions=True)
-
-    # Приводим к dict если вдруг вылетело исключение
-    if isinstance(rp, Exception):
-        log.warning(f"RusProfile {inn} exception: {rp}")
-        rp = {"inn": inn, "error": str(rp)}
-    if isinstance(fed, Exception):
-        log.warning(f"Федресурс {inn} exception: {fed}")
-        fed = {"inn": inn, "error": str(fed)}
-    if isinstance(fns, Exception):
-        log.warning(f"ФНС {inn} exception: {fns}")
-        fns = {"inn": inn, "error": str(fns)}
-
-    return _merge(inn, rp, fed, fns)
-
 
 async def enrich_batch(inns: list[str]) -> list[dict[str, Any]]:
     """
-    Обогащает список ИНН с ограничением параллелизма.
-    ENRICHMENT_CONCURRENCY — сколько ИНН обрабатываем одновременно.
+    Обогащает список ИНН:
+      - RusProfile: один браузер на весь батч (fetch_rusprofile_batch)
+      - Федресурс + ФНС: параллельно по ENRICHMENT_CONCURRENCY
     """
+    if not inns:
+        return []
+
+    # ── RusProfile: все ИНН через один браузер ──────────────────────────
+    log.info(f"RusProfile: батч {len(inns)} ИНН")
+    rp_list = await fetch_rusprofile_batch(inns)
+    rp_map  = {r["inn"]: r for r in rp_list}
+
+    # ── Федресурс + ФНС: параллельно ────────────────────────────────────
     semaphore = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
-    results: list[dict[str, Any]] = []
 
-    async def _worker(inn: str) -> dict[str, Any]:
+    async def _fetch_two(inn: str) -> tuple[str, dict, dict]:
         async with semaphore:
-            return await enrich_one(inn)
+            fed_task = asyncio.create_task(fetch_fedresurs(inn))
+            fns_task = asyncio.create_task(fetch_fns(inn))
+            fed, fns = await asyncio.gather(fed_task, fns_task, return_exceptions=True)
+            if isinstance(fed, Exception):
+                log.warning(f"Федресурс {inn}: {fed}")
+                fed = {"inn": inn, "error": str(fed)}
+            if isinstance(fns, Exception):
+                log.warning(f"ФНС {inn}: {fns}")
+                fns = {"inn": inn, "error": str(fns)}
+            return inn, fed, fns
 
-    tasks = [asyncio.create_task(_worker(inn)) for inn in inns]
+    tasks = [asyncio.create_task(_fetch_two(inn)) for inn in inns]
+    results: list[dict[str, Any]] = []
 
     for coro in asyncio.as_completed(tasks):
         try:
-            res = await coro
+            inn, fed, fns = await coro
+            rp  = rp_map.get(inn, {"inn": inn})
+            res = _merge(inn, rp, fed, fns)
             results.append(res)
             log.info(
-                f"  [{len(results)}/{len(inns)}] {res['inn']} — "
+                f"  [{len(results)}/{len(inns)}] {inn} — "
                 f"rev={res.get('revenue', 0):.0f}, "
                 f"FA={res.get('fixed_assets', 0):.0f}, "
                 f"leasing_msgs={res.get('leasing_raw_count', 0)}"
