@@ -1,0 +1,33 @@
+# Async HTTP
+httpx[http2]>=0.27.0
+asyncio
+
+# Playwright (JS-рендеринг для RusProfile)
+playwright>=1.43.0
+
+# Парсинг HTML
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+
+# Данные
+pandas>=2.2.0
+openpyxl>=3.1.2
+
+# NLP / fuzzy matching
+rapidfuzz>=3.9.0
+
+# База данных
+sqlalchemy[asyncio]>=2.0.29
+asyncpg>=0.29.0          # PostgreSQL async driver
+alembic>=1.13.0          # миграции
+
+# Очередь задач
+celery[redis]>=5.4.0
+redis>=5.0.0
+
+# Прогресс / утилиты
+tqdm>=4.66.0
+
+# Тесты
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
