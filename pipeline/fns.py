@@ -22,6 +22,17 @@ log = logging.getLogger(__name__)
 
 GIRBO_BASE = "https://bo.nalog.ru/nbo"
 
+# Circuit breaker: если ГИРБО вернул 403/недоступен — обходим его для
+# всех следующих ИНН в текущем запуске, чтобы не тратить время попусту.
+_girbo_circuit_open: bool = False
+
+
+def _open_girbo_circuit(reason: str) -> None:
+    global _girbo_circuit_open
+    if not _girbo_circuit_open:
+        log.warning(f"ГИРБО circuit breaker OPEN: {reason} — пропускаем ГИРБО для всех ИНН")
+        _girbo_circuit_open = True
+
 ELECTRICITY_KW = [
     "электроэнерги", "электр. энерг", "э/э",
     "коммунальные услуги", "потребление энергии", "энергоносител",
@@ -58,8 +69,18 @@ async def _girbo_search(client: httpx.AsyncClient, inn: str) -> list[dict]:
                 headers=_headers(),
                 timeout=15,
             )
+            # Не ретраим: 4xx не исправятся повтором
+            if r.status_code in (400, 403, 404):
+                _open_girbo_circuit(f"HTTP {r.status_code}")
+                log.debug(f"ГИРБО search {inn}: HTTP {r.status_code} — fast-fail")
+                return []
             r.raise_for_status()
             return r.json().get("content", [])
+        except httpx.HTTPStatusError:
+            raise
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            _open_girbo_circuit(str(e))
+            return []
         except Exception as e:
             log.debug(f"ГИРБО search attempt {attempt}: {e}")
             await asyncio.sleep(2 ** attempt)
@@ -74,9 +95,14 @@ async def _girbo_bfo_list(client: httpx.AsyncClient, org_id: int) -> list[dict]:
                 headers=_headers(),
                 timeout=15,
             )
+            if r.status_code in (400, 403, 404):
+                log.debug(f"ГИРБО bfo_list org={org_id}: HTTP {r.status_code} — fast-fail")
+                return []
             r.raise_for_status()
             data = r.json()
             return data if isinstance(data, list) else data.get("content", [data])
+        except httpx.HTTPStatusError:
+            raise
         except Exception as e:
             log.debug(f"ГИРБО bfo_list attempt {attempt}: {e}")
             await asyncio.sleep(2 ** attempt)
@@ -91,8 +117,13 @@ async def _girbo_bfo_detail(client: httpx.AsyncClient, bfo_id: int) -> dict:
                 headers=_headers(),
                 timeout=15,
             )
+            if r.status_code in (400, 403, 404):
+                log.debug(f"ГИРБО bfo_detail bfo={bfo_id}: HTTP {r.status_code} — fast-fail")
+                return {}
             r.raise_for_status()
             return r.json()
+        except httpx.HTTPStatusError:
+            raise
         except Exception as e:
             log.debug(f"ГИРБО bfo_detail attempt {attempt}: {e}")
             await asyncio.sleep(2 ** attempt)
@@ -171,6 +202,9 @@ async def fetch_fns(inn: str, year: int = REPORT_YEAR) -> dict[str, Any]:
     Запрашивает ГИР БО для ИНН.
     Возвращает финансовые данные + налоговую нагрузку.
     """
+    if _girbo_circuit_open:
+        return {"inn": inn, "error": "girbo_circuit_open"}
+
     result: dict[str, Any] = {
         "inn":          inn,
         "org_name":     "",
