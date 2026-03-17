@@ -1,12 +1,15 @@
 """
-fedresurs_keyword_search.py
+fedresurs_keyword_search.py  v2
 
-Прямой поиск на Федресурсе по ключевым словам (лизинг майнинг-оборудования).
-Не требует ЕГРЮЛ. Сохраняет CSV со всеми лизингополучателями.
+Стратегия:
+  1. POST /backend/companies/search  — ищем компании по ключевому слову в названии
+  2. POST /backend/companies/publications — для каждой компании берём публикации
+  3. Фильтруем публикации на слова: antminer, whatsminer, bitmain, microbt, эвм, сервер
+  4. Playwright-fallback, если API закрыт по IP
 
 Запуск:
     python fedresurs_keyword_search.py
-    python fedresurs_keyword_search.py --out my_results.csv --limit 500
+    python fedresurs_keyword_search.py --out results.csv --limit 500
 """
 from __future__ import annotations
 
@@ -32,238 +35,276 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Ключевые слова поиска ──────────────────────────────────────────────────
+# ── Ключевые слова для поиска компаний и фильтрации текстов ───────────────
 SEARCH_KEYWORDS: list[str] = [
-    "antminer",
-    "whatsminer",
-    "bitmain",
-    "microbt",
-    "асик майнер",
-    "asic майнер",
-    "майнинг оборудование лизинг",
-    "криптомайнер лизинг",
-    "эвм лизинг",
-    "сервер лизинг майнинг",
+    "antminer", "whatsminer", "bitmain", "microbt",
+    "асик", "майнинг", "mining", "криптовалют",
+    "эвм лизинг", "серверное оборудование лизинг",
 ]
 
-# ── Эндпоинты Федресурса (пробуем по порядку) ─────────────────────────────
-ENDPOINTS: list[str] = [
-    "https://fedresurs.ru/backend/efrs-messages",
-    "https://fedresurs.ru/backend/search",
-    "https://fedresurs.ru/api/messages",
+# Ключевые слова для фильтрации текста публикаций
+EQUIPMENT_KEYWORDS: list[str] = [
+    "antminer", "whatsminer", "bitmain", "microbt",
+    "асик", "asic", "майнер", "miner",
+    "s19", "s21", "m30", "m50", "m60",   # модели оборудования
+    "криптомайнер", "криптовалюта",
 ]
+
+BASE_URL = "https://fedresurs.ru"
 
 USER_AGENTS: list[str] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
 ]
 
-INN_RE = re.compile(r"(?:ИНН|inn)[:\s]*(\d{10,12})", re.IGNORECASE)
-MAX_PAGES_PER_KEYWORD = 25   # 25 × 40 = 1000 записей на слово
-PAGE_SIZE = 40
-MAX_RETRIES = 3
-DELAY_MIN = 1.5
-DELAY_MAX = 4.0
+MAX_RETRIES  = 3
+DELAY_MIN    = 1.5
+DELAY_MAX    = 4.0
+PAGE_SIZE    = 100
 
 
 def _headers() -> dict:
     return {
         "User-Agent":      random.choice(USER_AGENTS),
-        "Accept":          "application/json",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer":         "https://fedresurs.ru/",
-        "Origin":          "https://fedresurs.ru",
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+        "Content-Type":    "application/json",
+        "Origin":          BASE_URL,
+        "Referer":         BASE_URL + "/",
     }
 
 
-def _params(endpoint: str, query: str, limit: int, offset: int) -> dict:
-    if "efrs-messages" in endpoint:
-        return {"query": query, "limit": limit, "offset": offset}
-    elif "backend/search" in endpoint:
-        return {"searchString": query, "limit": limit, "offset": offset}
-    else:
-        return {"query": query, "limit": limit, "offset": offset}
-
-
-def _extract_inn(item: dict) -> str:
-    for field in ("entityInn", "inn", "companyInn", "participantInn",
-                  "debtorInn", "lessorInn", "lesseeInn"):
-        val = str(item.get(field, "")).strip()
-        if re.fullmatch(r"\d{10,12}", val):
-            return val
-    text = " ".join(str(item.get(k, "")) for k in (
-        "messageText", "text", "title", "description",
-        "entityName", "debtorName", "subject",
-    ))
-    m = INN_RE.search(text)
-    return m.group(1) if m else ""
-
-
-def _extract_name(item: dict) -> str:
-    for field in ("entityName", "debtorName", "lesseeName", "companyName",
-                  "name", "organizationName"):
-        val = str(item.get(field, "")).strip()
-        if val and val.lower() not in ("null", "none", ""):
-            return val
-    return ""
-
-
-def _extract_date(item: dict) -> str:
-    for field in ("publishedDate", "date", "messageDate", "createdDate",
-                  "contractDate", "signDate"):
-        val = str(item.get(field, "")).strip()
-        if val and val.lower() not in ("null", "none", ""):
-            return val[:10]  # берём только дату YYYY-MM-DD
-    return ""
-
-
-def _extract_text(item: dict) -> str:
-    parts = []
-    for field in ("messageText", "text", "title", "description",
-                  "subject", "contractSubject", "propertyDescription"):
-        v = str(item.get(field, "")).strip()
-        if v:
-            parts.append(v)
-    return " | ".join(parts)[:2000]
-
-
-def _extract_role(item: dict) -> str:
-    """Определяем роль: лизингополучатель или лизингодатель."""
-    text = _extract_text(item).lower()
-    msg_type = str(item.get("messageType", item.get("type", ""))).lower()
-
-    if any(w in text for w in ("лизингополучатель", "lessee", "арендатор")):
-        return "лизингополучатель"
-    if any(w in text for w in ("лизингодатель", "lessor", "арендодатель")):
-        return "лизингодатель"
-    return "неизвестно"
-
-
-def _normalise(item: dict, keyword: str) -> dict | None:
-    """Нормализует одну запись из API. Возвращает None если ИНН не найден."""
-    inn  = _extract_inn(item)
-    name = _extract_name(item)
-    if not inn and not name:
-        return None
-    return {
-        "inn":      inn,
-        "name":     name,
-        "role":     _extract_role(item),
-        "date":     _extract_date(item),
-        "keyword":  keyword,
-        "msg_type": str(item.get("messageType", item.get("type", ""))),
-        "text":     _extract_text(item),
-        "raw_id":   str(item.get("id", item.get("messageId", ""))),
-    }
-
-
-async def _probe_endpoint(client: httpx.AsyncClient) -> str | None:
-    """Находит рабочий эндпоинт (пробный запрос)."""
-    for ep in ENDPOINTS:
+async def _post(
+    client: httpx.AsyncClient, path: str, body: dict
+) -> dict | list | None:
+    url = BASE_URL + path
+    for attempt in range(MAX_RETRIES):
         try:
-            r = await client.get(
-                ep,
-                params=_params(ep, "antminer", 1, 0),
-                headers=_headers(),
-                timeout=20,
-            )
-            log.info(f"Probe {ep}: HTTP {r.status_code}")
+            r = await client.post(url, json=body, headers=_headers(), timeout=25)
+            if r.status_code == 429:
+                wait = 30 + random.uniform(0, 10)
+                log.warning(f"429 rate-limit — ждём {wait:.0f}с")
+                await asyncio.sleep(wait)
+                continue
             if r.status_code == 200:
-                try:
-                    r.json()
-                    return ep
-                except Exception:
-                    pass
+                return r.json()
+            log.debug(f"POST {path}: HTTP {r.status_code}")
+            return None
         except Exception as e:
-            log.warning(f"Probe {ep}: {e}")
+            log.debug(f"POST {path} attempt {attempt}: {e}")
+            await asyncio.sleep(2 ** attempt)
     return None
 
 
-async def _fetch_page(
-    client: httpx.AsyncClient,
-    endpoint: str,
-    keyword: str,
-    offset: int,
+async def _search_companies(
+    client: httpx.AsyncClient, keyword: str, start: int = 0
 ) -> tuple[list[dict], int]:
-    """Загружает одну страницу. Возвращает (items, total)."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = await client.get(
-                endpoint,
-                params=_params(endpoint, keyword, PAGE_SIZE, offset),
-                headers=_headers(),
-                timeout=25,
-            )
-            if r.status_code == 429:
-                wait = 30 + random.uniform(0, 15)
-                log.warning(f"Rate-limit 429 — ждём {wait:.0f}с")
-                await asyncio.sleep(wait)
-                continue
-            if r.status_code != 200:
-                log.warning(f"HTTP {r.status_code} для '{keyword}' offset={offset}")
-                return [], 0
-
-            data  = r.json()
-            items = (
-                data.get("data") or data.get("items") or
-                data.get("content") or data.get("messages") or
-                (data if isinstance(data, list) else [])
-            )
-            total = int(
-                data.get("total") or data.get("totalElements") or
-                data.get("count") or len(items) or 0
-            )
-            return items, total
-
-        except Exception as e:
-            log.debug(f"Attempt {attempt} keyword='{keyword}' offset={offset}: {e}")
-            await asyncio.sleep(2 ** attempt)
-
+    """POST /backend/companies/search → (список компаний, всего)."""
+    body = {
+        "entitySearchFilter": {
+            "onlyActive": False,
+            "startRowIndex": start,
+            "pageSize": PAGE_SIZE,
+            "name": keyword,
+        }
+    }
+    data = await _post(client, "/backend/companies/search", body)
+    if not data:
+        return [], 0
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("data") or data.get("companies") or []
+        total = int(data.get("total") or data.get("totalCount") or len(items) or 0)
+        return items, total
+    if isinstance(data, list):
+        return data, len(data)
     return [], 0
 
 
-async def search_keyword(
-    client: httpx.AsyncClient,
-    endpoint: str,
-    keyword: str,
-    max_results: int,
-) -> list[dict]:
-    """Пагинированный обход по одному ключевому слову."""
-    records: list[dict] = []
-    offset = 0
+async def _get_publications(
+    client: httpx.AsyncClient, guid: str, start: int = 0
+) -> tuple[list[dict], int]:
+    """POST /backend/companies/publications → (публикации, всего)."""
+    body = {
+        "guid": guid,
+        "pageSize": PAGE_SIZE,
+        "startRowIndex": start,
+        "searchSfactsMessage": True,
+        "searchFirmBankruptMessage": False,
+        "searchAmReport": False,
+        "searchCompanyEfrsb": False,
+    }
+    data = await _post(client, "/backend/companies/publications", body)
+    if not data:
+        return [], 0
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("data") or data.get("publications") or []
+        total = int(data.get("total") or data.get("totalCount") or len(items) or 0)
+        return items, total
+    if isinstance(data, list):
+        return data, len(data)
+    return [], 0
 
-    log.info(f"Поиск: «{keyword}»")
-    while offset < min(max_results, MAX_PAGES_PER_KEYWORD * PAGE_SIZE):
-        items, total = await _fetch_page(client, endpoint, keyword, offset)
-        if not items:
-            break
 
-        if offset == 0:
-            log.info(f"  «{keyword}»: всего {total} записей на Федресурсе")
+def _pub_text(pub: dict) -> str:
+    parts = []
+    for key in ("title", "text", "messageText", "description", "subject",
+                "contractSubject", "propertyDescription", "content"):
+        v = str(pub.get(key, "")).strip()
+        if v:
+            parts.append(v)
+    return " | ".join(parts)[:3000]
 
-        for item in items:
-            rec = _normalise(item, keyword)
-            if rec:
-                records.append(rec)
 
-        offset += PAGE_SIZE
-        if total and offset >= total:
-            break
+def _has_equipment(text: str) -> bool:
+    tl = text.lower()
+    return any(kw in tl for kw in EQUIPMENT_KEYWORDS)
 
-        await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    log.info(f"  «{keyword}»: собрано {len(records)} записей")
-    return records
+def _pub_date(pub: dict) -> str:
+    for key in ("publishedDate", "date", "messageDate", "datePublished", "createdDate"):
+        v = str(pub.get(key, "")).strip()
+        if v and v.lower() not in ("null", "none", ""):
+            return v[:10]
+    return ""
+
+
+def _pub_type(pub: dict) -> str:
+    return str(pub.get("messageType") or pub.get("type") or "")
+
+
+async def search_http(client: httpx.AsyncClient, max_per_kw: int) -> list[dict]:
+    """Основной поиск через HTTP API."""
+    results: list[dict] = []
+
+    for kw in SEARCH_KEYWORDS:
+        log.info(f"Поиск компаний: «{kw}»")
+        start = 0
+        companies_found = 0
+
+        while True:
+            companies, total = await _search_companies(client, kw, start)
+            if not companies:
+                break
+            if start == 0:
+                log.info(f"  «{kw}»: найдено {total} компаний")
+
+            for company in companies:
+                guid = str(company.get("guid") or company.get("id") or "").strip()
+                name = str(company.get("name") or company.get("entityName") or "").strip()
+                inn  = str(company.get("inn") or company.get("code") or "").strip()
+
+                if not guid:
+                    continue
+
+                # Получаем публикации компании
+                pub_start = 0
+                while True:
+                    pubs, pub_total = await _get_publications(client, guid, pub_start)
+                    if not pubs:
+                        break
+
+                    for pub in pubs:
+                        text = _pub_text(pub)
+                        if _has_equipment(text):
+                            results.append({
+                                "inn":      inn,
+                                "name":     name,
+                                "role":     "лизингополучатель (предположительно)",
+                                "date":     _pub_date(pub),
+                                "keyword":  kw,
+                                "msg_type": _pub_type(pub),
+                                "text":     text,
+                                "raw_id":   str(pub.get("id") or pub.get("guid") or ""),
+                            })
+                            log.info(f"    ✓ {name} [{inn}] — найдено оборудование")
+
+                    pub_start += PAGE_SIZE
+                    if pub_total and pub_start >= pub_total:
+                        break
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+
+                companies_found += 1
+                await asyncio.sleep(random.uniform(DELAY_MIN / 2, DELAY_MAX / 2))
+
+            start += PAGE_SIZE
+            if total and start >= min(total, max_per_kw):
+                break
+            if not companies:
+                break
+            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+        log.info(f"  «{kw}»: обработано {companies_found} компаний")
+        await asyncio.sleep(random.uniform(2.0, 5.0))
+
+    return results
+
+
+async def search_playwright(max_per_kw: int) -> list[dict]:
+    """Playwright-fallback: браузерный поиск на fedresurs.ru."""
+    results: list[dict] = []
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log.error("Playwright не установлен: pip install playwright && playwright install chromium")
+        return results
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+
+        for kw in SEARCH_KEYWORDS:
+            log.info(f"Playwright поиск: «{kw}»")
+            context = await browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                locale="ru-RU",
+                viewport={"width": 1280, "height": 800},
+            )
+            page = await context.new_page()
+            await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf}", lambda r: r.abort())
+
+            url = f"{BASE_URL}/search/entities?searchString={kw}"
+            try:
+                await page.goto(url, timeout=30_000, wait_until="networkidle")
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+
+                full_text = await page.inner_text("body")
+                lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+
+                # Ищем строки с ключевыми словами оборудования
+                for i, line in enumerate(lines):
+                    if _has_equipment(line):
+                        context_lines = lines[max(0, i-5):i+10]
+                        block = " | ".join(context_lines)
+                        # Пытаемся вытащить ИНН из блока
+                        inn_m = re.search(r"\b(\d{10}|\d{12})\b", block)
+                        inn = inn_m.group(1) if inn_m else ""
+                        results.append({
+                            "inn":      inn,
+                            "name":     "",
+                            "role":     "неизвестно",
+                            "date":     "",
+                            "keyword":  kw,
+                            "msg_type": "playwright",
+                            "text":     block[:2000],
+                            "raw_id":   "",
+                        })
+
+            except Exception as e:
+                log.warning(f"Playwright «{kw}»: {e}")
+
+            await context.close()
+            await asyncio.sleep(random.uniform(3.0, 6.0))
+
+        await browser.close()
+
+    return results
 
 
 def _deduplicate(records: list[dict]) -> list[dict]:
-    """Дедупликация по (inn, raw_id). Если ИНН пустой — по (name, date)."""
     seen: set[str] = set()
     result: list[dict] = []
     for r in records:
-        key = r["inn"] + r["raw_id"] if r["inn"] else r["name"] + r["date"]
+        key = (r["inn"] + r["raw_id"]) if (r["inn"] or r["raw_id"]) else r["text"][:100]
         if key not in seen:
             seen.add(key)
             result.append(r)
@@ -272,67 +313,61 @@ def _deduplicate(records: list[dict]) -> list[dict]:
 
 def _save_csv(records: list[dict], path: str) -> None:
     fields = ["inn", "name", "role", "date", "keyword", "msg_type", "text", "raw_id"]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(records)
-    log.info(f"CSV сохранён: {path} ({len(records)} строк)")
+    log.info(f"CSV: {path} ({len(records)} строк)")
 
 
-async def main(out_path: str, max_per_keyword: int) -> None:
-    Path("output").mkdir(exist_ok=True)
+async def main(out_path: str, max_per_kw: int) -> None:
+    all_records: list[dict] = []
+    api_ok = False
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(30.0),
         follow_redirects=True,
     ) as client:
-        endpoint = await _probe_endpoint(client)
-        if not endpoint:
-            log.error("Федресурс недоступен. Проверь подключение.")
-            sys.exit(1)
+        # Проверяем доступность API (тестовый запрос)
+        log.info("Проверяем доступность Федресурс API...")
+        test_companies, test_total = await _search_companies(client, "лизинг", 0)
+        if test_companies or test_total > 0:
+            log.info(f"API доступен (тест: {test_total} компаний)")
+            api_ok = True
+            all_records = await search_http(client, max_per_kw)
+        else:
+            log.warning("HTTP API недоступен — переключаемся на Playwright")
 
-        log.info(f"Используем эндпоинт: {endpoint}")
-
-        all_records: list[dict] = []
-        for kw in SEARCH_KEYWORDS:
-            records = await search_keyword(client, endpoint, kw, max_per_keyword)
-            all_records.extend(records)
-            await asyncio.sleep(random.uniform(3.0, 6.0))
+    if not api_ok:
+        all_records = await search_playwright(max_per_kw)
 
     deduped = _deduplicate(all_records)
-    log.info(f"Итого уникальных записей: {len(deduped)} (из {len(all_records)} до дедупликации)")
-
-    # Отдельный файл только с лизингополучателями
-    lessees = [r for r in deduped if r["role"] == "лизингополучатель"
-               or r["role"] == "неизвестно"]
-
     _save_csv(deduped, out_path)
 
-    # Краткая сводка по ключевым словам
     from collections import Counter
     kw_stats = Counter(r["keyword"] for r in deduped)
+
     print("\n" + "=" * 60)
-    print(f"  ГОТОВО — Федресурс лизинг оборудования")
-    print(f"  Всего записей:          {len(deduped)}")
-    print(f"  С ИНН:                  {sum(1 for r in deduped if r['inn'])}")
-    print(f"  Лизингополучателей:     {sum(1 for r in deduped if r['role'] == 'лизингополучатель')}")
-    print(f"  CSV: {out_path}")
-    print("\n  По ключевым словам:")
-    for kw, cnt in kw_stats.most_common():
-        print(f"    {kw:<35} {cnt}")
+    print("  ФЕДРЕСУРС — ЛИЗИНГ МАЙНИНГ-ОБОРУДОВАНИЯ")
+    print(f"  Найдено записей:    {len(deduped)}")
+    print(f"  С ИНН:              {sum(1 for r in deduped if r['inn'])}")
+    print(f"  Метод:              {'HTTP API' if api_ok else 'Playwright'}")
+    print(f"  CSV:                {out_path}")
+    if kw_stats:
+        print("\n  По ключевым словам:")
+        for kw, cnt in kw_stats.most_common():
+            print(f"    {kw:<40} {cnt}")
     print("=" * 60 + "\n")
+
+    # Всегда выходим с кодом 0 — артефакты должны сохраниться
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Федресурс — поиск лизинга оборудования")
-    parser.add_argument(
-        "--out", default=f"output/fedresurs_leasing_{date.today()}.csv",
-        help="Путь к выходному CSV"
-    )
-    parser.add_argument(
-        "--limit", type=int, default=1000,
-        help="Макс. записей на одно ключевое слово (default: 1000)"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", default=f"output/fedresurs_leasing_{date.today()}.csv")
+    parser.add_argument("--limit", type=int, default=500,
+                        help="Макс. компаний на ключевое слово")
     args = parser.parse_args()
-
     asyncio.run(main(args.out, args.limit))

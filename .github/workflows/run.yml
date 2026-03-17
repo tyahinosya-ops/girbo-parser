@@ -4,13 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Макс. записей на одно ключевое слово"
+        description: "Макс. компаний на ключевое слово"
         required: false
-        default: "1000"
+        default: "500"
         type: string
 
   schedule:
-    # Каждое воскресенье в 03:00 UTC
     - cron: "0 3 * * 0"
 
 jobs:
@@ -29,31 +28,31 @@ jobs:
       - name: Установить зависимости
         run: |
           pip install --upgrade pip
-          pip install "httpx[http2]" pandas openpyxl
+          pip install "httpx[http2]" pandas openpyxl playwright
+
+      - name: Установить Playwright Chromium (fallback)
+        run: playwright install chromium --with-deps
 
       - name: Создать папку output
         run: mkdir -p output
 
-      - name: Поиск лизинга (antminer / whatsminer / bitmain / microbt / эвм / сервер)
+      - name: Поиск лизинга оборудования на Федресурсе
         run: |
           python fedresurs_keyword_search.py \
-            --limit ${{ github.event.inputs.limit || '1000' }} \
+            --limit "${{ github.event.inputs.limit || '500' }}" \
             --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv"
 
       - name: Показать итоги
         if: always()
         run: |
           echo "=== Файлы в output/ ==="
-          ls -lah output/
+          ls -lah output/ 2>/dev/null || echo "Папка output пуста"
           echo ""
           echo "=== Первые 20 строк CSV ==="
-          head -20 output/fedresurs_leasing_*.csv 2>/dev/null || echo "CSV не найден"
+          head -20 output/fedresurs_leasing_*.csv 2>/dev/null || echo "CSV не создан"
           echo ""
-          echo "=== Статистика ==="
           COUNT=$(tail -n +2 output/fedresurs_leasing_*.csv 2>/dev/null | wc -l || echo 0)
-          WITH_INN=$(tail -n +2 output/fedresurs_leasing_*.csv 2>/dev/null | awk -F',' 'NR>1 && $1~/[0-9]{10}/' | wc -l || echo 0)
-          echo "Всего записей: $COUNT"
-          echo "С ИНН:         $WITH_INN"
+          WITH_INN=$(awk -F',' 'NR>1 && length($1)==10' output/fedresurs_leasing_*.csv 2>/dev/null | wc -l || echo 0)
           echo "::notice::Федресурс: записей=$COUNT, с ИНН=$WITH_INN"
 
       - name: Сохранить результаты
