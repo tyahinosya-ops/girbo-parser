@@ -1,20 +1,22 @@
-name: Mining Parser
+name: Федресурс — лизинг майнинг-оборудования
+
 on:
   workflow_dispatch:
     inputs:
-      category:
-        description: "Категория поиска"
+      limit:
+        description: "Макс. записей на одно ключевое слово"
         required: false
-        default: "both"
-        type: choice
-        options:
-          - both
-          - hosting
-          - mining
+        default: "1000"
+        type: string
+
+  schedule:
+    # Каждое воскресенье в 03:00 UTC
+    - cron: "0 3 * * 0"
 
 jobs:
-  parse:
+  search:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -22,49 +24,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Установить зависимости
-        run: pip install requests pandas beautifulsoup4 lxml tqdm openpyxl
+        run: |
+          pip install --upgrade pip
+          pip install "httpx[http2]" pandas openpyxl
 
       - name: Создать папку output
         run: mkdir -p output
 
-      - name: Поиск хостингов и ЦОД (ОКВЭД → ЕГРЮЛ → ГИРБО)
-        if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'hosting' }}
-        run: python girbo_parser.py --category hosting --source api --debug
+      - name: Поиск лизинга (antminer / whatsminer / bitmain / microbt / эвм / сервер)
+        run: |
+          python fedresurs_keyword_search.py \
+            --limit ${{ github.event.inputs.limit || '1000' }} \
+            --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv"
 
-      - name: Поиск майнеров (Федресурс → ГИРБО)
-        if: ${{ github.event.inputs.category == 'both' || github.event.inputs.category == 'mining' }}
-        run: python girbo_parser.py --category mining --source api --debug
-
-      - name: Диагностика — вывести отчёты
+      - name: Показать итоги
         if: always()
         run: |
-          echo "===FILES==="
+          echo "=== Файлы в output/ ==="
           ls -lah output/
-          echo "===HOSTING_REPORT==="
-          cat output/run_report_hosting_*.txt 2>/dev/null || echo "HOSTING_REPORT_NOT_FOUND"
-          echo "===MINING_REPORT==="
-          cat output/run_report_mining_*.txt 2>/dev/null || echo "MINING_REPORT_NOT_FOUND"
-          echo "===INNS_HOSTING==="
-          wc -l output/inns_hosting_*.txt 2>/dev/null && head -5 output/inns_hosting_*.txt 2>/dev/null || echo "INN_HOSTING_NOT_FOUND"
-          echo "===INNS_MINING==="
-          wc -l output/inns_mining_*.txt 2>/dev/null && head -5 output/inns_mining_*.txt 2>/dev/null || echo "INN_MINING_NOT_FOUND"
-          echo "===CSV_HOSTING==="
-          wc -l output/mining_leads_hosting_*.csv 2>/dev/null && head -3 output/mining_leads_hosting_*.csv 2>/dev/null || echo "CSV_HOSTING_NOT_FOUND"
-          echo "===CSV_MINING==="
-          wc -l output/mining_leads_mining_*.csv 2>/dev/null && head -3 output/mining_leads_mining_*.csv 2>/dev/null || echo "CSV_MINING_NOT_FOUND"
-          HOSTING_INN_COUNT=$(wc -l < output/inns_hosting_*.txt 2>/dev/null || echo 0)
-          MINING_INN_COUNT=$(wc -l < output/inns_mining_*.txt 2>/dev/null || echo 0)
-          CSV_HOST=$(wc -l < output/mining_leads_hosting_*.csv 2>/dev/null || echo 0)
-          CSV_MIN=$(wc -l < output/mining_leads_mining_*.csv 2>/dev/null || echo 0)
-          echo "::warning::ИТОГ: хостинг_ИНН=$HOSTING_INN_COUNT майнинг_ИНН=$MINING_INN_COUNT хостинг_CSV=$CSV_HOST майнинг_CSV=$CSV_MIN"
+          echo ""
+          echo "=== Первые 20 строк CSV ==="
+          head -20 output/fedresurs_leasing_*.csv 2>/dev/null || echo "CSV не найден"
+          echo ""
+          echo "=== Статистика ==="
+          COUNT=$(tail -n +2 output/fedresurs_leasing_*.csv 2>/dev/null | wc -l || echo 0)
+          WITH_INN=$(tail -n +2 output/fedresurs_leasing_*.csv 2>/dev/null | awk -F',' 'NR>1 && $1~/[0-9]{10}/' | wc -l || echo 0)
+          echo "Всего записей: $COUNT"
+          echo "С ИНН:         $WITH_INN"
+          echo "::notice::Федресурс: записей=$COUNT, с ИНН=$WITH_INN"
 
       - name: Сохранить результаты
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mining-leads-${{ github.run_number }}
+          name: fedresurs-leasing-${{ github.run_number }}
           path: output/
+          retention-days: 30
           if-no-files-found: warn
-
