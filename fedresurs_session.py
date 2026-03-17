@@ -101,10 +101,36 @@ async def _init_session(client: httpx.AsyncClient) -> str:
         return ""
 
 
+def _detect_items(data: dict | list) -> tuple[list, int]:
+    """Извлекает items и total из ответа с любой структурой."""
+    if isinstance(data, list):
+        return data, len(data)
+    if not isinstance(data, dict):
+        return [], 0
+    # Ищем список среди всех значений
+    for key, val in data.items():
+        if isinstance(val, list) and len(val) > 0:
+            # total — любое числовое поле с "total"/"count"/"size"
+            total = 0
+            for tkey in ("total", "totalCount", "totalElements", "count", "size"):
+                if data.get(tkey):
+                    total = int(data[tkey])
+                    break
+            if not total:
+                total = len(val)
+            return val, total
+    # Нет данных, но может быть total > 0
+    for tkey in ("total", "totalCount", "totalElements", "count", "size"):
+        if data.get(tkey) and int(data[tkey]) > 0:
+            return [], int(data[tkey])
+    return [], 0
+
+
 async def _probe_endpoint(
     client: httpx.AsyncClient, method: str, path: str, param: str, xsrf: str
 ) -> bool:
     """Пробует эндпоинт с probe-словом «лизинг». Возвращает True если получены данные."""
+    import json as _json
     url = BASE + path
     try:
         if method == "GET":
@@ -112,31 +138,31 @@ async def _probe_endpoint(
                 url,
                 params={"limit": 1, "offset": 0, param: "лизинг"},
                 headers=_base_headers(xsrf),
-                timeout=15,
+                timeout=30,
             )
         else:
             r = await client.post(
                 url,
                 json={"limit": 1, "offset": 0, param: "лизинг"},
                 headers={**_base_headers(xsrf), "Content-Type": "application/json"},
-                timeout=15,
+                timeout=30,
             )
-        if r.status_code != 200:
-            log.debug(f"  probe {method} {path} ?{param}: HTTP {r.status_code}")
+        log.info(f"  probe {method} {path} ?{param}: HTTP {r.status_code}")
+        if r.status_code not in (200, 201):
             return False
-        data = r.json()
-        # Считаем эндпоинт рабочим, если вернул список или dict с items
-        has_data = False
-        if isinstance(data, list) and len(data) > 0:
-            has_data = True
-        elif isinstance(data, dict):
-            items = data.get("items") or data.get("data") or data.get("messages") or []
-            total = int(data.get("total") or data.get("totalCount") or 0)
-            has_data = len(items) > 0 or total > 0
-        log.info(f"  probe {method} {path} ?{param}={param!r}: HTTP {r.status_code} → данные={has_data}")
+        raw = r.text[:3000]
+        log.info(f"  RAW: {raw}")   # ← видим структуру ответа в логах Actions
+        try:
+            data = r.json()
+        except Exception:
+            log.warning(f"  Не JSON: {raw[:200]}")
+            return False
+        items, total = _detect_items(data)
+        has_data = len(items) > 0 or total > 0
+        log.info(f"  → items={len(items)}, total={total}, has_data={has_data}")
         return has_data
     except Exception as e:
-        log.debug(f"  probe {method} {path}: {e}")
+        log.info(f"  probe {method} {path}: {type(e).__name__}: {e}")
         return False
 
 
@@ -171,12 +197,7 @@ async def _fetch_page(
             if r.status_code != 200:
                 return [], 0
             data = r.json()
-            if isinstance(data, list):
-                return data, len(data)
-            if isinstance(data, dict):
-                items = data.get("items") or data.get("data") or data.get("messages") or []
-                total = int(data.get("total") or data.get("totalCount") or len(items) or 0)
-                return items, total
+            return _detect_items(data)
         except Exception as e:
             log.debug(f"fetch_page attempt {attempt}: {e}")
             await asyncio.sleep(2 ** attempt)
@@ -304,10 +325,11 @@ async def main(out_path: str) -> None:
             await asyncio.sleep(1.0)
 
         if working is None:
-            log.error(
+            log.warning(
                 "Ни один search-эндпоинт не вернул данные.\n"
-                "fedresurs.ru блокирует запросы с GitHub Actions.\n"
-                "Попробуйте запустить локально."
+                "Возможные причины: блокировка IP GitHub Actions, "
+                "смена структуры API, таймаут.\n"
+                "Проверьте строки RAW выше в логах."
             )
         else:
             method, path, param = working
