@@ -22,19 +22,15 @@ jobs:
       - name: Установить зависимости
         run: |
           pip install --upgrade pip
-          pip install "httpx[http2]" playwright
-
-      - name: Установить браузер Chromium
-        run: playwright install chromium --with-deps
+          pip install "httpx[http2]"
 
       - name: Создать папку output
         run: mkdir -p output
 
       - name: Поиск лизинга оборудования на Федресурсе
         run: |
-          python fedresurs_playwright.py \
-            --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv" \
-            --headless
+          python fedresurs_session.py \
+            --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv"
 
       - name: Показать итоги
         if: always()
