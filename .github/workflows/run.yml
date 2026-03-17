@@ -28,6 +28,8 @@ jobs:
         run: mkdir -p output
 
       - name: Поиск лизинга оборудования на Федресурсе
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           python fedresurs_session.py \
             --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv"

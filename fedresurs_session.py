@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import csv
 import logging
+import os
 import random
 import re
 import sys
@@ -306,11 +307,26 @@ async def main(out_path: str) -> None:
         "date", "subject", "msg_id", "msg_url",
     ]
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(25.0),
+    # Прокси: PROXY_URL из env/secrets, например socks5://user:pass@host:port
+    proxy_url = os.environ.get("PROXY_URL") or os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY")
+    if proxy_url:
+        log.info(f"Используем прокси: {proxy_url.split('@')[-1]}")  # скрываем логин/пароль
+    else:
+        log.warning(
+            "PROXY_URL не задан. Fedresurs.ru защищён Qrator и блокирует IP GitHub Actions.\n"
+            "Задайте секрет PROXY_URL (socks5://user:pass@host:1080) в Settings → Secrets.\n"
+            "Продолжаем без прокси (вероятно ConnectTimeout) ..."
+        )
+
+    client_kwargs = dict(
+        timeout=httpx.Timeout(30.0),
         follow_redirects=True,
         limits=httpx.Limits(max_connections=3),
-    ) as client:
+    )
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         # 1. Получаем сессионные куки
         xsrf = await _init_session(client)
 
