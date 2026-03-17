@@ -1,14 +1,17 @@
 """
-fedresurs_session.py  v6
+fedresurs_session.py  v7
 
-httpx-сессионный подход:
-  1. GET fedresurs.ru  → получаем cookies + XSRF-token
-  2. Пробуем несколько вариантов search-эндпоинта с теми же куками
-  3. Фильтруем ответы по ключевым словам локально
+Цель: выгрузить ВСЕ записи Федресурса о лизинге майнинг-оборудования.
+
+Стратегия ключевых слов:
+  EXACT  — бренды/модели, однозначно указывают на майнинг (фильтрация не нужна)
+  BROAD  — общие термины (ЭВМ, сервер), принимаются только если в тексте
+           записи есть хотя бы одно слово из MINING_INDICATORS
 
 Запуск:
     python fedresurs_session.py
     python fedresurs_session.py --out results.csv
+    PROXY_URL=socks5://user:pass@host:1080 python fedresurs_session.py
 """
 from __future__ import annotations
 
@@ -34,17 +37,58 @@ log = logging.getLogger(__name__)
 
 BASE = "https://fedresurs.ru"
 
-KEYWORDS: list[str] = [
+# ---------------------------------------------------------------------------
+# Ключевые слова
+# ---------------------------------------------------------------------------
+
+# EXACT — достаточно найти в тексте, однозначно майнинг
+KEYWORDS_EXACT: list[str] = [
+    # Bitmain
     "antminer",
-    "whatsminer",
     "bitmain",
+    # MicroBT
+    "whatsminer",
     "microbt",
+    # Canaan Creative
+    "canaan",
+    "avalon miner",
+    # Innosilicon
     "innosilicon",
-    "asic майнер",
-    "асик майнер",
+    # Goldshell
+    "goldshell",
+    # Jasminer (Ethash)
+    "jasminer",
+    # Ebang
+    "ebang",
+    # iBeLink
+    "ibelink",
+    # Общие термины, достаточно специфичные
+    "асик",                           # кириллица
+    "asic",                           # латиница
     "майнинговое оборудование",
     "оборудование для майнинга",
+    "оборудование для добычи криптовалют",
+    "добыча криптовалюты",
+    "майнинг криптовалют",
+    "хэшрейт",
+    "hashrate",
 ]
+
+# BROAD — требуют подтверждения через MINING_INDICATORS
+KEYWORDS_BROAD: list[str] = [
+    "эвм",                            # электронная вычислительная машина
+    "вычислительное оборудование",
+    "серверное оборудование",
+]
+
+# Слова, подтверждающие майнинг-контекст для BROAD-запросов
+MINING_INDICATORS: frozenset[str] = frozenset({
+    "antminer", "whatsminer", "bitmain", "microbt", "canaan",
+    "innosilicon", "goldshell", "jasminer", "ebang", "ibelink",
+    "асик", "asic", "майнинг", "mining", "криптовалют",
+    "хэшрейт", "hashrate", "blockchain", "блокчейн",
+    "добыча цифровой", "цифровая валюта",
+})
 
 PAGE_SIZE = 40
 MAX_PAGES = 100  # ~4000 записей на ключевое слово
@@ -55,7 +99,7 @@ UA = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
-# Варианты search-эндпоинтов для перебора
+# Варианты search-эндпоинтов — перебираем пока не найдём рабочий
 SEARCH_ENDPOINTS = [
     ("GET",  "/backend/sfacts",          "searchString"),
     ("GET",  "/backend/sfacts",          "query"),
@@ -69,6 +113,10 @@ SEARCH_ENDPOINTS = [
     ("POST", "/backend/sfacts",          "searchString"),
 ]
 
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
 
 def _extract_inn(text: str) -> str:
     m = re.search(r"\b(\d{10}|\d{12})\b", text or "")
@@ -91,12 +139,11 @@ def _base_headers(xsrf: str = "") -> dict:
 
 
 async def _init_session(client: httpx.AsyncClient) -> str:
-    """Открывает главную страницу, получает куки и XSRF-токен."""
+    """Открывает главную страницу — получаем куки и XSRF-токен."""
     try:
         r = await client.get(BASE + "/", timeout=20, headers={"User-Agent": UA})
         log.info(f"Главная: HTTP {r.status_code}, куки: {list(client.cookies.keys())}")
-        xsrf = client.cookies.get("XSRF-TOKEN", "")
-        return xsrf
+        return client.cookies.get("XSRF-TOKEN", "")
     except Exception as e:
         log.warning(f"Ошибка init_session: {e}")
         return ""
@@ -108,19 +155,14 @@ def _detect_items(data: dict | list) -> tuple[list, int]:
         return data, len(data)
     if not isinstance(data, dict):
         return [], 0
-    # Ищем список среди всех значений
-    for key, val in data.items():
+    for val in data.values():
         if isinstance(val, list) and len(val) > 0:
-            # total — любое числовое поле с "total"/"count"/"size"
             total = 0
             for tkey in ("total", "totalCount", "totalElements", "count", "size"):
                 if data.get(tkey):
                     total = int(data[tkey])
                     break
-            if not total:
-                total = len(val)
-            return val, total
-    # Нет данных, но может быть total > 0
+            return val, total or len(val)
     for tkey in ("total", "totalCount", "totalElements", "count", "size"):
         if data.get(tkey) and int(data[tkey]) > 0:
             return [], int(data[tkey])
@@ -130,8 +172,7 @@ def _detect_items(data: dict | list) -> tuple[list, int]:
 async def _probe_endpoint(
     client: httpx.AsyncClient, method: str, path: str, param: str, xsrf: str
 ) -> bool:
-    """Пробует эндпоинт с probe-словом «лизинг». Возвращает True если получены данные."""
-    import json as _json
+    """Пробует эндпоинт с probe-словом «лизинг». True — данные есть."""
     url = BASE + path
     try:
         if method == "GET":
@@ -152,7 +193,7 @@ async def _probe_endpoint(
         if r.status_code not in (200, 201):
             return False
         raw = r.text[:3000]
-        log.info(f"  RAW: {raw}")   # ← видим структуру ответа в логах Actions
+        log.info(f"  RAW: {raw}")
         try:
             data = r.json()
         except Exception:
@@ -172,7 +213,7 @@ async def _fetch_page(
     method: str, path: str, param: str, xsrf: str,
     keyword: str, offset: int,
 ) -> tuple[list[dict], int]:
-    """Запрашивает одну страницу результатов. Возвращает (items, total)."""
+    """Запрашивает одну страницу. Возвращает (items, total)."""
     url = BASE + path
     for attempt in range(3):
         try:
@@ -181,14 +222,14 @@ async def _fetch_page(
                     url,
                     params={"limit": PAGE_SIZE, "offset": offset, param: keyword},
                     headers=_base_headers(xsrf),
-                    timeout=20,
+                    timeout=25,
                 )
             else:
                 r = await client.post(
                     url,
                     json={"limit": PAGE_SIZE, "offset": offset, param: keyword},
                     headers={**_base_headers(xsrf), "Content-Type": "application/json"},
-                    timeout=20,
+                    timeout=25,
                 )
             if r.status_code == 429:
                 wait = 30 + random.uniform(0, 15)
@@ -197,46 +238,56 @@ async def _fetch_page(
                 continue
             if r.status_code != 200:
                 return [], 0
-            data = r.json()
-            return _detect_items(data)
+            return _detect_items(r.json())
         except Exception as e:
             log.debug(f"fetch_page attempt {attempt}: {e}")
             await asyncio.sleep(2 ** attempt)
     return [], 0
 
 
-def _parse_msg(msg: dict, keyword: str) -> dict:
-    def pick(*keys):
-        for k in keys:
-            v = msg.get(k)
-            if v and str(v).strip().lower() not in ("null", "none", ""):
-                return str(v).strip()
-        return ""
+# ---------------------------------------------------------------------------
+# Парсинг одного сообщения
+# ---------------------------------------------------------------------------
 
-    subject = pick(
+def _get_nested(d: dict, *keys: str) -> str:
+    """Безопасно достаёт первое непустое значение из словаря d по списку ключей."""
+    for k in keys:
+        v = d.get(k)
+        if v and str(v).strip().lower() not in ("null", "none", ""):
+            return str(v).strip()
+    return ""
+
+
+def _parse_msg(msg: dict, keyword: str) -> dict:
+    # Предмет лизинга / описание объекта
+    subject = _get_nested(
+        msg,
         "subject", "contractSubject", "leaseSubject",
         "propertyDescription", "objectDescription",
         "description", "title", "text", "messageText",
     )
 
+    # Лизингополучатель
     lessee_inn = lessee_name = ""
-    for k in ("lessee", "pledgor", "debtor", "client"):
-        p = msg.get(k)
-        if isinstance(p, dict):
-            lessee_inn  = pick.__wrapped__(p, "inn", "code", "tin") if hasattr(pick, "__wrapped__") else (p.get("inn") or p.get("code") or "")
-            lessee_name = (p.get("name") or p.get("fullName") or p.get("shortName") or "")
+    for role_key in ("lessee", "pledgor", "debtor", "client", "borrower"):
+        party = msg.get(role_key)
+        if isinstance(party, dict):
+            lessee_inn  = _get_nested(party, "inn", "code", "tin", "ogrn")
+            lessee_name = _get_nested(party, "name", "fullName", "shortName", "title")
             if lessee_inn or lessee_name:
                 break
 
+    # Лизингодатель
     lessor_inn = lessor_name = ""
-    for k in ("lessor", "pledgee", "creditor", "lender"):
-        p = msg.get(k)
-        if isinstance(p, dict):
-            lessor_inn  = (p.get("inn") or p.get("code") or "")
-            lessor_name = (p.get("name") or p.get("fullName") or p.get("shortName") or "")
+    for role_key in ("lessor", "pledgee", "creditor", "lender", "financier"):
+        party = msg.get(role_key)
+        if isinstance(party, dict):
+            lessor_inn  = _get_nested(party, "inn", "code", "tin", "ogrn")
+            lessor_name = _get_nested(party, "name", "fullName", "shortName", "title")
             if lessor_inn or lessor_name:
                 break
 
+    # Fallback: ИНН из текста предмета
     if not lessee_inn:
         lessee_inn = _extract_inn(subject)
 
@@ -245,10 +296,10 @@ def _parse_msg(msg: dict, keyword: str) -> dict:
 
     return {
         "keyword":     keyword,
-        "lessee_inn":  str(lessee_inn),
-        "lessee_name": str(lessee_name)[:200],
-        "lessor_inn":  str(lessor_inn),
-        "lessor_name": str(lessor_name)[:200],
+        "lessee_inn":  lessee_inn,
+        "lessee_name": lessee_name[:200],
+        "lessor_inn":  lessor_inn,
+        "lessor_name": lessor_name[:200],
         "date":        pub_date,
         "subject":     subject[:1000],
         "msg_id":      msg_id,
@@ -256,69 +307,96 @@ def _parse_msg(msg: dict, keyword: str) -> dict:
     }
 
 
-def _kw_match(msg: dict, keyword: str) -> bool:
-    """Проверяет, упоминается ли ключевое слово в любом текстовом поле."""
-    kw_lo = keyword.lower()
-    text = " ".join(
+def _msg_text(msg: dict) -> str:
+    """Всё текстовое содержимое сообщения в нижнем регистре."""
+    return " ".join(
         str(v) for v in msg.values()
         if isinstance(v, (str, int, float))
     ).lower()
-    return kw_lo in text
 
+
+def _is_relevant(msg: dict, keyword: str, exact: bool) -> bool:
+    """
+    Проверяет релевантность сообщения.
+    exact=True  → достаточно наличия keyword в тексте
+    exact=False → keyword + хотя бы один MINING_INDICATOR
+    """
+    text = _msg_text(msg)
+    if keyword.lower() not in text:
+        return False
+    if exact:
+        return True
+    return any(ind in text for ind in MINING_INDICATORS)
+
+
+# ---------------------------------------------------------------------------
+# Поиск по одному ключевому слову
+# ---------------------------------------------------------------------------
 
 async def search_keyword(
     client: httpx.AsyncClient,
     method: str, path: str, param: str, xsrf: str,
     keyword: str,
+    exact: bool,
 ) -> list[dict]:
     results: list[dict] = []
     offset = 0
     for page_num in range(MAX_PAGES):
-        items, total = await _fetch_page(client, method, path, param, xsrf, keyword, offset)
+        items, total = await _fetch_page(
+            client, method, path, param, xsrf, keyword, offset
+        )
         if not items:
             break
         if page_num == 0:
-            log.info(f"  «{keyword}»: total={total}")
+            log.info(f"  «{keyword}»: всего~{total} записей в API")
 
-        matched = [_parse_msg(m, keyword) for m in items if _kw_match(m, keyword)]
-        results.extend(matched)
-
-        for r in matched:
-            log.info(
-                f"    [{r['lessee_inn'] or '?':12}] "
-                f"{r['lessee_name'] or '(без имени)':<35} | "
-                f"{r['subject'][:55]}"
-            )
+        for m in items:
+            if _is_relevant(m, keyword, exact):
+                rec = _parse_msg(m, keyword)
+                results.append(rec)
+                log.info(
+                    f"    [{rec['lessee_inn'] or '?':12}] "
+                    f"{rec['lessee_name'] or '(без имени)':<35} | "
+                    f"{rec['subject'][:60]}"
+                )
 
         offset += PAGE_SIZE
         if total and offset >= total:
             break
         await asyncio.sleep(random.uniform(1.0, 2.5))
 
-    log.info(f"  «{keyword}»: найдено {len(results)} совпадений")
+    log.info(f"  «{keyword}»: отобрано {len(results)} записей")
     return results
 
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
 async def main(out_path: str) -> None:
-    all_records: list[dict] = []
     fields = [
         "keyword", "lessee_inn", "lessee_name",
         "lessor_inn", "lessor_name",
         "date", "subject", "msg_id", "msg_url",
     ]
 
-    # Прокси: PROXY_URL из env/secrets, например socks5://user:pass@host:port
-    proxy_url = os.environ.get("PROXY_URL") or os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY")
+    # Прокси — socks5://user:pass@host:port  или  http://host:port
+    proxy_url = (
+        os.environ.get("PROXY_URL")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("ALL_PROXY")
+    )
     if proxy_url:
-        log.info(f"Используем прокси: {proxy_url.split('@')[-1]}")  # скрываем логин/пароль
+        safe = proxy_url.split("@")[-1]  # скрываем логин/пароль в логах
+        log.info(f"Прокси: {safe}")
     else:
         log.warning(
-            "PROXY_URL не задан. Fedresurs.ru защищён Qrator и блокирует IP GitHub Actions.\n"
-            "Задайте секрет PROXY_URL (socks5://user:pass@host:1080) в Settings → Secrets.\n"
-            "Продолжаем без прокси (вероятно ConnectTimeout) ..."
+            "PROXY_URL не задан. fedresurs.ru защищён Qrator "
+            "и блокирует IP GitHub Actions (ConnectTimeout).\n"
+            "Задайте секрет PROXY_URL=socks5://user:pass@host:port"
         )
 
-    client_kwargs = dict(
+    client_kwargs: dict = dict(
         timeout=httpx.Timeout(30.0),
         follow_redirects=True,
         limits=httpx.Limits(max_connections=3),
@@ -326,40 +404,51 @@ async def main(out_path: str) -> None:
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
 
+    all_records: list[dict] = []
+
     async with httpx.AsyncClient(**client_kwargs) as client:
-        # 1. Получаем сессионные куки
         xsrf = await _init_session(client)
 
-        # 2. Находим рабочий эндпоинт
+        # Находим рабочий эндпоинт
         working: tuple | None = None
         log.info("Ищем рабочий search-эндпоинт ...")
-        for method, path, param in SEARCH_ENDPOINTS:
-            if await _probe_endpoint(client, method, path, param, xsrf):
-                working = (method, path, param)
-                log.info(f"✓ Рабочий эндпоинт: {method} {path} ?{param}=...")
+        for ep_method, ep_path, ep_param in SEARCH_ENDPOINTS:
+            if await _probe_endpoint(client, ep_method, ep_path, ep_param, xsrf):
+                working = (ep_method, ep_path, ep_param)
+                log.info(f"✓ Рабочий эндпоинт: {ep_method} {ep_path} ?{ep_param}=...")
                 break
             await asyncio.sleep(1.0)
 
         if working is None:
             log.warning(
-                "Ни один search-эндпоинт не вернул данные.\n"
-                "Возможные причины: блокировка IP GitHub Actions, "
-                "смена структуры API, таймаут.\n"
-                "Проверьте строки RAW выше в логах."
+                "Ни один search-эндпоинт не ответил данными.\n"
+                "Причины: блокировка IP / смена API / таймаут.\n"
+                "Смотрите строки RAW выше."
             )
         else:
-            method, path, param = working
-            for kw in KEYWORDS:
-                log.info(f"Ключевое слово: «{kw}»")
-                recs = await search_keyword(client, method, path, param, xsrf, kw)
+            ep_method, ep_path, ep_param = working
+
+            # Сначала точные (exact), потом широкие (broad) с доп-фильтром
+            todo = (
+                [(kw, True)  for kw in KEYWORDS_EXACT] +
+                [(kw, False) for kw in KEYWORDS_BROAD]
+            )
+            for kw, exact in todo:
+                kind = "exact" if exact else "broad+filter"
+                log.info(f"Ключевое слово [{kind}]: «{kw}»")
+                recs = await search_keyword(
+                    client, ep_method, ep_path, ep_param, xsrf, kw, exact
+                )
                 all_records.extend(recs)
                 await asyncio.sleep(random.uniform(2.0, 5.0))
 
-    # Дедупликация
+    # Дедупликация по msg_id или составному ключу
     seen: set[str] = set()
     deduped: list[dict] = []
     for r in all_records:
-        key = r["msg_id"] or (r["lessee_inn"] + r["date"] + r["keyword"] + r["subject"][:30])
+        key = r["msg_id"] or (
+            r["lessee_inn"] + "|" + r["date"] + "|" + r["subject"][:40]
+        )
         if key not in seen:
             seen.add(key)
             deduped.append(r)
@@ -372,23 +461,28 @@ async def main(out_path: str) -> None:
         writer.writerows(deduped)
     log.info(f"CSV: {out_path} ({len(deduped)} строк)")
 
+    # Итоговая статистика
     from collections import Counter
     kw_stats = Counter(r["keyword"] for r in deduped)
-    print("\n" + "=" * 60)
-    print("  ФЕДРЕСУРС — ЛИЗИНГ МАЙНИНГ-ОБОРУДОВАНИЯ  v6")
-    print(f"  Рабочий эндпоинт:  {working or 'НЕ НАЙДЕН'}")
-    print(f"  Найдено записей:   {len(deduped)}")
-    print(f"  С ИНН:             {sum(1 for r in deduped if r['lessee_inn'])}")
+    inn_count = sum(1 for r in deduped if r["lessee_inn"])
+
+    print("\n" + "=" * 65)
+    print("  ФЕДРЕСУРС — ЛИЗИНГ МАЙНИНГ-ОБОРУДОВАНИЯ  v7")
+    print(f"  Рабочий эндпоинт:    {working or 'НЕ НАЙДЕН'}")
+    print(f"  Найдено записей:     {len(deduped)}")
+    print(f"  С ИНН лизингополуч.: {inn_count}")
     if kw_stats:
         print("\n  По ключевым словам:")
         for kw, cnt in kw_stats.most_common():
-            print(f"    {kw:<45} {cnt}")
-    print("=" * 60 + "\n")
-    # всегда выходим с кодом 0 — CI не падает
+            print(f"    {kw:<50} {cnt}")
+    print("=" * 65 + "\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default=f"output/fedresurs_leasing_{date.today()}.csv")
+    parser.add_argument(
+        "--out",
+        default=f"output/fedresurs_leasing_{date.today()}.csv",
+    )
     args = parser.parse_args()
     asyncio.run(main(args.out))
