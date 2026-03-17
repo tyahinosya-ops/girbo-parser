@@ -21,8 +21,11 @@ log = logging.getLogger(__name__)
 INN_RE = re.compile(r"(?:ИНН|inn)[:\s]*(\d{10,12})", re.IGNORECASE)
 
 FEDRESURS_ENDPOINTS = [
-    "https://fedresurs.ru/backend/search",
+    # Актуальный публичный API (2024-2025)
     "https://fedresurs.ru/backend/efrs-messages",
+    # Fallback — старый backend
+    "https://fedresurs.ru/backend/search",
+    # Fallback — REST API
     "https://fedresurs.ru/api/messages",
 ]
 
@@ -77,6 +80,17 @@ def _extract_leasing_text(item: dict) -> str:
     return " ".join(parts)
 
 
+def _params_for(endpoint: str, inn: str, limit: int = 1, offset: int = 0) -> dict:
+    """Возвращает параметры запроса под конкретный endpoint."""
+    if "efrs-messages" in endpoint:
+        # Актуальный API: параметр "query"
+        return {"query": inn, "limit": limit, "offset": offset}
+    elif "backend/search" in endpoint:
+        return {"searchString": inn, "limit": limit, "offset": offset}
+    else:
+        return {"inn": inn, "limit": limit, "offset": offset}
+
+
 async def _probe_endpoint(
     client: httpx.AsyncClient, inn: str
 ) -> str | None:
@@ -85,7 +99,7 @@ async def _probe_endpoint(
         try:
             r = await client.get(
                 ep,
-                params={"searchString": inn, "limit": 1, "offset": 0},
+                params=_params_for(ep, inn),
                 headers=_headers(),
                 timeout=20,
             )
@@ -111,11 +125,7 @@ async def _fetch_leasing_by_inn(
     while offset < 400:
         for attempt in range(MAX_RETRIES):
             try:
-                params: dict[str, Any] = {
-                    "searchString": inn,
-                    "limit": limit,
-                    "offset": offset,
-                }
+                params: dict[str, Any] = _params_for(endpoint, inn, limit, offset)
                 r = await client.get(
                     endpoint,
                     params=params,
@@ -175,9 +185,93 @@ async def _fetch_leasing_by_inn(
     return results
 
 
+async def _fetch_fedresurs_playwright(inn: str) -> dict[str, Any]:
+    """
+    Playwright-fallback: загружает страницу компании на fedresurs.ru через браузер.
+    Используется когда HTTP API недоступен (бан, капча, авторизация).
+    """
+    result: dict[str, Any] = {
+        "inn": inn, "leasing_texts": [], "raw_count": 0, "error": None,
+    }
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        result["error"] = "playwright_not_installed"
+        return result
+
+    from config import PLAYWRIGHT_HEADLESS, PLAYWRIGHT_TIMEOUT_MS
+    from pipeline.rusprofile import _build_proxy_cfg, _pick_proxy
+
+    proxy_cfg = _build_proxy_cfg(_pick_proxy())
+    leasing_texts: list[str] = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=PLAYWRIGHT_HEADLESS, proxy=proxy_cfg)
+        context = await browser.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            locale="ru-RU",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await context.new_page()
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,css}", lambda r: r.abort())
+
+        search_url = f"https://fedresurs.ru/search/entities?searchString={inn}"
+        try:
+            await page.goto(search_url, timeout=PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
+        except Exception as e:
+            result["error"] = str(e)
+            await browser.close()
+            return result
+
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+        # Ищем ссылку на карточку компании
+        company_link = None
+        try:
+            link_el = await page.query_selector(".company-name a, .search-result a, h3 > a")
+            if link_el:
+                href = await link_el.get_attribute("href")
+                if href:
+                    company_link = href if href.startswith("http") else "https://fedresurs.ru" + href
+        except Exception:
+            pass
+
+        if not company_link:
+            # Пробуем прямой URL по ИНН
+            company_link = f"https://fedresurs.ru/company/{inn}"
+
+        try:
+            await page.goto(company_link, timeout=PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
+        except Exception as e:
+            result["error"] = str(e)
+            await browser.close()
+            return result
+
+        await asyncio.sleep(random.uniform(2.0, 3.0))
+
+        # Ищем сообщения о лизинге в тексте страницы
+        try:
+            full_text = await page.inner_text("body")
+            lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+            for line in lines:
+                line_low = line.lower()
+                if any(kw in line_low for kw in ["лизинг", "аренда", "leasing", "финансовая аренда"]):
+                    leasing_texts.append(line)
+        except Exception as e:
+            log.debug(f"Федресурс playwright текст {inn}: {e}")
+
+        await browser.close()
+
+    result["leasing_texts"] = leasing_texts
+    result["raw_count"] = len(leasing_texts)
+    log.debug(f"Федресурс playwright {inn}: {len(leasing_texts)} строк с лизингом")
+    return result
+
+
 async def fetch_fedresurs(inn: str) -> dict[str, Any]:
     """
     Ищет лизинговые договоры для ИНН на Федресурсе.
+    Сначала пробует HTTP API, при неудаче — Playwright.
     Возвращает: {"inn": ..., "leasing_texts": [...], "raw_count": N}
     """
     result: dict[str, Any] = {
@@ -194,17 +288,13 @@ async def fetch_fedresurs(inn: str) -> dict[str, Any]:
         follow_redirects=True,
     ) as client:
         endpoint = await _probe_endpoint(client, inn)
-        if not endpoint:
-            log.warning(f"Федресурс: нет рабочего endpoint для ИНН {inn}")
-            result["error"] = "no_endpoint"
+        if endpoint:
+            items = await _fetch_leasing_by_inn(client, inn, endpoint)
+            result["raw_count"] = len(items)
+            result["leasing_texts"] = [i["text"] for i in items if i["text"].strip()]
+            log.debug(f"Федресурс {inn}: {len(items)} сообщений via API")
             return result
 
-        items = await _fetch_leasing_by_inn(client, inn, endpoint)
-        result["raw_count"] = len(items)
-
-        texts = [i["text"] for i in items if i["text"].strip()]
-        result["leasing_texts"] = texts
-
-        log.debug(f"Федресурс {inn}: {len(items)} сообщений, {len(texts)} с текстом")
-
-    return result
+    # HTTP API недоступен — пробуем Playwright
+    log.info(f"Федресурс {inn}: HTTP API недоступен, fallback на Playwright")
+    return await _fetch_fedresurs_playwright(inn)

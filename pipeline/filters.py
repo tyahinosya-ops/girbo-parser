@@ -91,6 +91,10 @@ def _passes_fixed_assets(company: dict) -> tuple[bool, str]:
 
 def _passes_electricity(company: dict) -> tuple[bool, str]:
     ee = company.get("electricity", 0.0) or 0.0
+    if ee == 0.0:
+        # Данные отсутствуют (ГИРБО недоступен) — не отфильтровываем,
+        # скоринг учтёт отсутствие данных через нулевой вес.
+        return True, ""
     if ee < MIN_ELECTRICITY_EXPENSE:
         return False, f"ЭЭ {ee:,.0f} < {MIN_ELECTRICITY_EXPENSE:,.0f}"
     return True, ""
