@@ -9,7 +9,7 @@ on:
 jobs:
   search:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -22,15 +22,19 @@ jobs:
       - name: Установить зависимости
         run: |
           pip install --upgrade pip
-          pip install "httpx[http2]"
+          pip install "httpx[http2]" playwright
+
+      - name: Установить браузер Chromium
+        run: playwright install chromium --with-deps
 
       - name: Создать папку output
         run: mkdir -p output
 
       - name: Поиск лизинга оборудования на Федресурсе
         run: |
-          python fedresurs_keyword_search.py \
-            --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv"
+          python fedresurs_playwright.py \
+            --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv" \
+            --headless
 
       - name: Показать итоги
         if: always()
@@ -41,8 +45,13 @@ jobs:
           echo "=== Первые 20 строк CSV ==="
           head -20 output/fedresurs_leasing_*.csv 2>/dev/null || echo "CSV не создан"
           echo ""
-          COUNT=$(tail -n +2 output/fedresurs_leasing_*.csv 2>/dev/null | wc -l || echo 0)
-          WITH_INN=$(awk -F',' 'NR>1 && length($1)==10' output/fedresurs_leasing_*.csv 2>/dev/null | wc -l || echo 0)
+          CSV=$(ls output/fedresurs_leasing_*.csv 2>/dev/null | head -1)
+          if [ -n "$CSV" ]; then
+            COUNT=$(tail -n +2 "$CSV" | wc -l)
+            WITH_INN=$(awk -F',' 'NR>1 && length($2)>=10' "$CSV" | wc -l)
+          else
+            COUNT=0; WITH_INN=0
+          fi
           echo "::notice::Федресурс: записей=$COUNT, с ИНН=$WITH_INN"
 
       - name: Сохранить результаты
