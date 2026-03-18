@@ -179,12 +179,13 @@ def classify_lessor(okved: str, name: str) -> str:
 
 
 def _params_for(endpoint: str, query: str, limit: int = 40, offset: int = 0) -> dict:
+    page = offset // limit  # Федресурс использует page (0-based), не offset
     if "efrs-messages" in endpoint:
-        return {"query": query, "limit": limit, "offset": offset}
+        return {"query": query, "limit": limit, "offset": offset, "page": page}
     elif "backend/search" in endpoint:
-        return {"searchString": query, "limit": limit, "offset": offset}
+        return {"searchString": query, "limit": limit, "offset": offset, "page": page}
     else:
-        return {"q": query, "limit": limit, "offset": offset}
+        return {"q": query, "limit": limit, "offset": offset, "page": page}
 
 
 async def _probe_endpoint(client: httpx.AsyncClient, query: str) -> str | None:
@@ -213,15 +214,17 @@ async def _fetch_pages(
     client: httpx.AsyncClient,
     query: str,
     endpoint: str,
-    max_pages: int = 100,
+    max_pages: int = 50,
 ) -> list[dict]:
     """
     Пагинированный обход сообщений по запросу (ИНН или ключевое слово).
+    Останавливается при дублировании страниц или исчерпании результатов.
     """
     results: list[dict] = []
+    seen_ids: set = set()       # дедупликация по id сообщения
     offset, limit = 0, 40
 
-    for _ in range(max_pages):
+    for page_num in range(max_pages):
         for attempt in range(MAX_RETRIES):
             try:
                 r = await client.get(
@@ -250,12 +253,31 @@ async def _fetch_pages(
                 )
 
                 if not items:
+                    log.debug(f"Федресурс '{query}': страница {page_num} пуста — стоп")
                     return results
 
-                results.extend(items)
+                # Дедупликация: стоп если все id на странице уже видели
+                new_items = []
+                for item in items:
+                    item_id = (
+                        item.get("id") or item.get("messageId") or
+                        item.get("guid") or str(item)[:100]
+                    )
+                    if item_id not in seen_ids:
+                        seen_ids.add(item_id)
+                        new_items.append(item)
+
+                if not new_items:
+                    log.debug(f"Федресурс '{query}': страница {page_num} — все дубли, стоп")
+                    return results
+
+                results.extend(new_items)
+                log.debug(f"Федресурс '{query}': страница {page_num}, +{len(new_items)} новых")
+
                 offset += limit
 
                 if total and offset >= total:
+                    log.debug(f"Федресурс '{query}': достигли total={total}")
                     return results
 
                 await asyncio.sleep(_rand_delay())
