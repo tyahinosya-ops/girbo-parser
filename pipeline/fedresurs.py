@@ -23,17 +23,22 @@ log = logging.getLogger(__name__)
 
 INN_RE = re.compile(r"(?:ИНН|inn)[:\s]*(\d{10,12})", re.IGNORECASE)
 
-FEDRESURS_ENDPOINTS = [
-    "https://fedresurs.ru/backend/efrs-messages",
-    "https://fedresurs.ru/backend/search",
-    "https://fedresurs.ru/api/messages",
+BASE = "https://fedresurs.ru"
+PAGE_SIZE = 40
+
+# Эндпоинты в порядке приоритета (метод, путь, параметр поиска)
+FEDRESURS_ENDPOINTS: list[tuple[str, str, str]] = [
+    ("GET",  "/backend/sfacts",        "searchString"),
+    ("GET",  "/backend/sfacts",        "query"),
+    ("GET",  "/backend/sfacts",        "q"),
+    ("GET",  "/backend/search",        "searchString"),
+    ("GET",  "/backend/messages",      "searchString"),
+    ("POST", "/backend/sfacts/search", "searchString"),
+    ("POST", "/backend/sfacts",        "searchString"),
 ]
 
 LEASING_MESSAGE_TYPES = [
-    "ФинансоваяАренда",
-    "Leasing",
-    "LeasingContract",
-    "УведомлениеОЛизинге",
+    "ФинансоваяАренда", "Leasing", "LeasingContract", "УведомлениеОЛизинге",
 ]
 
 # ── Ключевые слова для поиска майнингового оборудования ─────────────────────
@@ -67,20 +72,61 @@ def _rand_delay() -> float:
     return random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
 
 
-def _headers() -> dict:
-    return {
+def _headers(xsrf: str = "") -> dict:
+    h = {
         "User-Agent":      random.choice(USER_AGENTS),
-        "Accept":          "application/json",
+        "Accept":          "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer":         "https://fedresurs.ru/",
-        "Origin":          "https://fedresurs.ru",
+        "Referer":         BASE + "/",
+        "Origin":          BASE,
+        "Connection":      "keep-alive",
     }
+    if xsrf:
+        h["X-XSRF-TOKEN"]     = xsrf
+        h["X-Requested-With"] = "XMLHttpRequest"
+    return h
 
 
 def _make_transport() -> httpx.AsyncHTTPTransport | None:
     if not PROXIES:
         return None
     return httpx.AsyncHTTPTransport(proxy=random.choice(PROXIES))
+
+
+async def _init_session(client: httpx.AsyncClient) -> str:
+    """Открывает главную страницу Федресурса — получает XSRF-TOKEN."""
+    try:
+        r = await client.get(
+            BASE + "/",
+            headers={"User-Agent": random.choice(USER_AGENTS)},
+            timeout=20,
+        )
+        xsrf = client.cookies.get("XSRF-TOKEN", "")
+        log.info(f"Федресурс сессия: HTTP {r.status_code}, XSRF={'да' if xsrf else 'нет'}")
+        return xsrf
+    except Exception as e:
+        log.warning(f"Федресурс init_session: {e}")
+        return ""
+
+
+def _detect_items(data: dict | list) -> tuple[list, int]:
+    """Извлекает items и total из ответа с любой структурой."""
+    if isinstance(data, list):
+        return data, len(data)
+    if not isinstance(data, dict):
+        return [], 0
+    for val in data.values():
+        if isinstance(val, list) and len(val) > 0:
+            total = 0
+            for tkey in ("total", "totalCount", "totalElements", "count", "size"):
+                if data.get(tkey):
+                    total = int(data[tkey])
+                    break
+            return val, total or len(val)
+    for tkey in ("total", "totalCount", "totalElements", "count", "size"):
+        if data.get(tkey) and int(data[tkey]) > 0:
+            return [], int(data[tkey])
+    return [], 0
 
 
 def _extract_inn(item: dict, fields: tuple[str, ...]) -> str:
@@ -178,31 +224,42 @@ def classify_lessor(okved: str, name: str) -> str:
     return "other"
 
 
-def _params_for(endpoint: str, query: str, limit: int = 40, offset: int = 0) -> dict:
-    page = offset // limit  # Федресурс использует page (0-based), не offset
-    if "efrs-messages" in endpoint:
-        return {"query": query, "limit": limit, "offset": offset, "page": page}
-    elif "backend/search" in endpoint:
-        return {"searchString": query, "limit": limit, "offset": offset, "page": page}
-    else:
-        return {"q": query, "limit": limit, "offset": offset, "page": page}
-
-
-async def _probe_endpoint(client: httpx.AsyncClient, query: str) -> str | None:
-    """Перебирает эндпоинты, возвращает рабочий."""
-    for ep in FEDRESURS_ENDPOINTS:
+async def _probe_endpoints(
+    client: httpx.AsyncClient, xsrf: str
+) -> tuple[str, str, str] | None:
+    """
+    Перебирает эндпоинты, возвращает первый рабочий (метод, путь, параметр).
+    """
+    for method, path, param in FEDRESURS_ENDPOINTS:
+        url = BASE + path
         try:
-            r = await client.get(
-                ep,
-                params=_params_for(ep, query, limit=1),
-                headers=_headers(),
-                timeout=20,
-            )
-            log.debug(f"Федресурс probe {ep}: HTTP {r.status_code}")
-            if r.status_code == 200:
-                return ep
+            if method == "GET":
+                r = await client.get(
+                    url,
+                    params={"limit": 1, "offset": 0, param: "лизинг"},
+                    headers=_headers(xsrf),
+                    timeout=20,
+                )
+            else:
+                r = await client.post(
+                    url,
+                    json={"limit": 1, "offset": 0, param: "лизинг"},
+                    headers={**_headers(xsrf), "Content-Type": "application/json"},
+                    timeout=20,
+                )
+            log.debug(f"Федресурс probe {method} {path}: HTTP {r.status_code}")
+            if r.status_code != 200:
+                continue
+            try:
+                data = r.json()
+                items, total = _detect_items(data)
+                if items or total:
+                    log.info(f"Федресурс: рабочий эндпоинт {method} {path} ?{param}")
+                    return method, path, param
+            except Exception:
+                continue
         except Exception as e:
-            log.debug(f"Федресурс {ep}: {e}")
+            log.debug(f"Федресурс probe {path}: {e}")
     return None
 
 
@@ -213,26 +270,39 @@ async def _probe_endpoint(client: httpx.AsyncClient, query: str) -> str | None:
 async def _fetch_pages(
     client: httpx.AsyncClient,
     query: str,
-    endpoint: str,
+    method: str,
+    path: str,
+    param: str,
+    xsrf: str,
     max_pages: int = 50,
 ) -> list[dict]:
     """
-    Пагинированный обход сообщений по запросу (ИНН или ключевое слово).
-    Останавливается при дублировании страниц или исчерпании результатов.
+    Пагинированный обход сообщений по запросу.
+    Останавливается при дублировании или исчерпании результатов.
     """
     results: list[dict] = []
-    seen_ids: set = set()       # дедупликация по id сообщения
-    offset, limit = 0, 40
+    seen_ids: set = set()
+    offset = 0
+    url = BASE + path
 
     for page_num in range(max_pages):
         for attempt in range(MAX_RETRIES):
             try:
-                r = await client.get(
-                    endpoint,
-                    params=_params_for(endpoint, query, limit, offset),
-                    headers=_headers(),
-                    timeout=20,
-                )
+                if method == "GET":
+                    r = await client.get(
+                        url,
+                        params={"limit": PAGE_SIZE, "offset": offset, param: query},
+                        headers=_headers(xsrf),
+                        timeout=25,
+                    )
+                else:
+                    r = await client.post(
+                        url,
+                        json={"limit": PAGE_SIZE, "offset": offset, param: query},
+                        headers={**_headers(xsrf), "Content-Type": "application/json"},
+                        timeout=25,
+                    )
+
                 if r.status_code == 429:
                     wait = 30 + random.uniform(0, 10)
                     log.warning(f"Федресурс 429 — ждём {wait:.0f}с")
@@ -242,42 +312,33 @@ async def _fetch_pages(
                     log.debug(f"Федресурс HTTP {r.status_code} для '{query}'")
                     return results
 
-                data = r.json()
-                items: list[dict] = (
-                    data.get("data") or data.get("items") or
-                    data.get("content") or data.get("messages") or []
-                )
-                total = int(
-                    data.get("total") or data.get("totalElements") or
-                    data.get("count") or 0
-                )
+                items, total = _detect_items(r.json())
 
                 if not items:
                     log.debug(f"Федресурс '{query}': страница {page_num} пуста — стоп")
                     return results
 
-                # Дедупликация: стоп если все id на странице уже видели
+                # Дедупликация
                 new_items = []
                 for item in items:
                     item_id = (
                         item.get("id") or item.get("messageId") or
-                        item.get("guid") or str(item)[:100]
+                        item.get("guid") or item.get("number") or
+                        f"{item.get('date','')}_{item.get('subject','')[:40]}"
                     )
                     if item_id not in seen_ids:
                         seen_ids.add(item_id)
                         new_items.append(item)
 
                 if not new_items:
-                    log.debug(f"Федресурс '{query}': страница {page_num} — все дубли, стоп")
+                    log.debug(f"Федресурс '{query}': стр.{page_num} — все дубли, стоп")
                     return results
 
                 results.extend(new_items)
-                log.debug(f"Федресурс '{query}': страница {page_num}, +{len(new_items)} новых")
+                log.debug(f"Федресурс '{query}': стр.{page_num} +{len(new_items)} (всего {len(results)})")
 
-                offset += limit
-
+                offset += PAGE_SIZE
                 if total and offset >= total:
-                    log.debug(f"Федресурс '{query}': достигли total={total}")
                     return results
 
                 await asyncio.sleep(_rand_delay())
@@ -329,7 +390,8 @@ async def search_by_keywords(
         follow_redirects=True,
     ) as client:
 
-        endpoint = await _probe_endpoint(client, keywords[0])
+        xsrf = await _init_session(client)
+        endpoint = await _probe_endpoints(client, xsrf)
         if not endpoint:
             log.warning("Федресурс: ни один эндпоинт не доступен")
             return {
@@ -340,13 +402,14 @@ async def search_by_keywords(
                 "error":        "no_endpoint",
             }
 
-        log.info(f"Федресурс: используем эндпоинт {endpoint}")
+        method, path, param = endpoint
+        log.info(f"Федресурс: используем эндпоинт {method} {path} ?{param}")
 
         for keyword in keywords:
             log.info(f"Федресурс: поиск по '{keyword}'")
             stats["keywords_searched"] += 1
 
-            items = await _fetch_pages(client, keyword, endpoint)
+            items = await _fetch_pages(client, keyword, method, path, param, xsrf)
             stats["contracts_found"] += len(items)
 
             for item in items:
@@ -445,9 +508,11 @@ async def fetch_fedresurs(inn: str) -> dict[str, Any]:
         timeout=httpx.Timeout(25.0),
         follow_redirects=True,
     ) as client:
-        endpoint = await _probe_endpoint(client, inn)
+        xsrf = await _init_session(client)
+        endpoint = await _probe_endpoints(client, xsrf)
         if endpoint:
-            items = await _fetch_pages(client, inn, endpoint)
+            method, path, param = endpoint
+            items = await _fetch_pages(client, inn, method, path, param, xsrf)
             result["raw_count"] = len(items)
             result["leasing_texts"] = [
                 _extract_leasing_text(i) for i in items
