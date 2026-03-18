@@ -1,8 +1,7 @@
 # Async HTTP
 httpx[http2]>=0.27.0
-asyncio
 
-# Playwright (JS-рендеринг для RusProfile)
+# Playwright (JS-рендеринг для RusProfile / Федресурс fallback)
 playwright>=1.43.0
 
 # Парсинг HTML
@@ -27,6 +26,7 @@ redis>=5.0.0
 
 # Прогресс / утилиты
 tqdm>=4.66.0
+python-dateutil>=2.9.0   # парсинг дат регистрации из ЕГРЮЛ
 
 # Тесты
 pytest>=8.0.0
