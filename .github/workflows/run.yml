@@ -1,20 +1,21 @@
-name: Федресурс — лизинг майнинг-оборудования
+name: Парсер майнеров и хостингов
 
 on:
-  workflow_dispatch:
-
+  workflow_dispatch:        # Ручной запуск из GitHub UI
   schedule:
-    - cron: "0 3 * * 0"
+    - cron: "0 3 * * 0"    # Каждое воскресенье в 03:00 UTC
 
 jobs:
-  search:
+  parse:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Установить Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
@@ -22,41 +23,47 @@ jobs:
       - name: Установить зависимости
         run: |
           pip install --upgrade pip
-          pip install "httpx[http2]"
+          pip install -r requirements.txt
+
+      - name: Установить Playwright браузер
+        run: playwright install --with-deps chromium
 
       - name: Создать папку output
         run: mkdir -p output
 
-      - name: Поиск лизинга оборудования на Федресурсе
+      - name: Запустить пайплайн
         env:
-          PROXY_URL: ${{ secrets.PROXY_URL }}
+          # Добавь секрет PROXY_URL в Settings → Secrets → Actions
+          # Формат: socks5://user:pass@host:port  или  http://host:port
+          # Без прокси Федресурс может блокировать GitHub IP (Qrator)
+          PROXIES: ${{ secrets.PROXY_URL }}
         run: |
-          python fedresurs_session.py \
-            --out "output/fedresurs_leasing_$(date +%Y-%m-%d).csv"
+          python main.py --mode fedresurs --skip-db
 
       - name: Показать итоги
         if: always()
         run: |
           echo "=== Файлы в output/ ==="
           ls -lah output/ 2>/dev/null || echo "Папка output пуста"
-          echo ""
-          echo "=== Первые 20 строк CSV ==="
-          head -20 output/fedresurs_leasing_*.csv 2>/dev/null || echo "CSV не создан"
-          echo ""
-          CSV=$(ls output/fedresurs_leasing_*.csv 2>/dev/null | head -1)
-          if [ -n "$CSV" ]; then
-            COUNT=$(tail -n +2 "$CSV" | wc -l)
-            WITH_INN=$(awk -F',' 'NR>1 && length($2)>=10' "$CSV" | wc -l)
-          else
-            COUNT=0; WITH_INN=0
-          fi
-          echo "::notice::Федресурс: записей=$COUNT, с ИНН=$WITH_INN"
 
-      - name: Сохранить результаты
+          CSV=$(ls output/leads_fedresurs_*.csv 2>/dev/null | head -1)
+          if [ -n "$CSV" ]; then
+            echo ""
+            echo "=== Первые 20 строк ==="
+            head -20 "$CSV"
+            echo ""
+            TOTAL=$(tail -n +2 "$CSV" | wc -l)
+            HOT=$(tail -n +2 "$CSV" | awk -F',' '$NF=="Горячий" || $(NF-1)=="Горячий"' | wc -l)
+            echo "::notice::Итого: $TOTAL компаний | Горячих: $HOT"
+          else
+            echo "::warning::CSV не создан — возможно Федресурс заблокировал (нужен прокси)"
+          fi
+
+      - name: Сохранить результаты как артефакт
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fedresurs-leasing-${{ github.run_number }}
+          name: leads-${{ github.run_number }}-${{ github.run_attempt }}
           path: output/
           retention-days: 30
           if-no-files-found: warn
