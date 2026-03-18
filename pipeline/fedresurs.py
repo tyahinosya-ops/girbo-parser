@@ -1,5 +1,8 @@
 """
-fedresurs.py — async поиск лизинговых договоров на Федресурсе
+fedresurs.py — поиск лизинговых договоров на Федресурсе
+
+ПУТЬ А (майнеры)   — ищем по ключевым словам, берём ЛИЗИНГОПОЛУЧАТЕЛЕЙ
+ПУТЬ Б (хостинги)  — те же договоры, берём ЛИЗИНГОДАТЕЛЕЙ (не финансовых)
 """
 from __future__ import annotations
 
@@ -21,15 +24,11 @@ log = logging.getLogger(__name__)
 INN_RE = re.compile(r"(?:ИНН|inn)[:\s]*(\d{10,12})", re.IGNORECASE)
 
 FEDRESURS_ENDPOINTS = [
-    # Актуальный публичный API (2024-2025)
     "https://fedresurs.ru/backend/efrs-messages",
-    # Fallback — старый backend
     "https://fedresurs.ru/backend/search",
-    # Fallback — REST API
     "https://fedresurs.ru/api/messages",
 ]
 
-# Типы сообщений, связанные с лизингом
 LEASING_MESSAGE_TYPES = [
     "ФинансоваяАренда",
     "Leasing",
@@ -37,6 +36,32 @@ LEASING_MESSAGE_TYPES = [
     "УведомлениеОЛизинге",
 ]
 
+# ── Ключевые слова для поиска майнингового оборудования ─────────────────────
+MINING_SEARCH_KEYWORDS: list[str] = [
+    "antminer",
+    "whatsminer",
+    "bitmain",
+    "microbt",
+    "асик",
+    "asic",
+    "майнер",
+    "miner",
+    "эвм",
+    "криптовалют",
+]
+
+# ── Фильтрация финансовых лизингодателей ────────────────────────────────────
+FINANCIAL_OKVED_PREFIXES: tuple[str, ...] = ("64.", "65.", "66.")
+FINANCIAL_OKVED_EXACT: set[str] = {"64.91", "64.19", "64.99"}
+FINANCIAL_NAME_KEYWORDS: tuple[str, ...] = (
+    "банк", "страхов", "финансов", "кредит",
+    "мфо", "микрофинанс", "факторинг",
+)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Вспомогательные функции
+# ════════════════════════════════════════════════════════════════════════════
 
 def _rand_delay() -> float:
     return random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
@@ -58,48 +83,117 @@ def _make_transport() -> httpx.AsyncHTTPTransport | None:
     return httpx.AsyncHTTPTransport(proxy=random.choice(PROXIES))
 
 
-def _extract_inn(item: dict) -> str:
-    """Пытается вытащить ИНН из разных полей ответа."""
-    for field in ("entityInn", "inn", "companyInn", "participantInn", "debtorInn"):
+def _extract_inn(item: dict, fields: tuple[str, ...]) -> str:
+    """Извлекает ИНН из указанных полей или текста."""
+    for field in fields:
         val = str(item.get(field, "")).strip()
         if re.fullmatch(r"\d{10,12}", val):
             return val
-    text = " ".join(
-        str(item.get(k, ""))
-        for k in ("messageText", "text", "title", "description", "entityName", "debtorName")
-    )
+    # Fallback: ищем в тексте
+    text = " ".join(str(item.get(k, "")) for k in (
+        "messageText", "text", "title", "description",
+    ))
     m = INN_RE.search(text)
     return m.group(1) if m else ""
 
 
+def _extract_lessee_inn(item: dict) -> str:
+    """ИНН лизингополучателя (ПУТЬ А — майнеры)."""
+    return _extract_inn(item, (
+        "lesseeInn", "debtorInn", "entityInn",
+        "participantInn", "companyInn", "inn",
+    ))
+
+
+def _extract_lessor_inn(item: dict) -> str:
+    """ИНН лизингодателя (ПУТЬ Б — хостинги)."""
+    return _extract_inn(item, (
+        "lessorInn", "creditorInn", "lenderInn",
+        "counterpartyInn", "ownerInn",
+    ))
+
+
+def _extract_lessor_meta(item: dict) -> tuple[str, str]:
+    """Возвращает (ИНН лизингодателя, название лизингодателя)."""
+    inn = _extract_lessor_inn(item)
+    name = str(item.get(
+        "lessorName",
+        item.get("creditorName", item.get("counterpartyName", ""))
+    )).strip()
+    return inn, name
+
+
+def _extract_lessor_okved(item: dict) -> str:
+    """ОКВЭД лизингодателя если есть в ответе."""
+    return str(item.get(
+        "lessorOkved",
+        item.get("creditorOkved", item.get("counterpartyOkved", ""))
+    )).strip()
+
+
 def _extract_leasing_text(item: dict) -> str:
-    """Собирает весь текстовый контент из сообщения."""
-    fields = ["messageText", "text", "title", "description", "subject",
-              "contractSubject", "propertyDescription"]
+    fields = [
+        "messageText", "text", "title", "description",
+        "subject", "contractSubject", "propertyDescription",
+    ]
     parts = [str(item.get(f, "")) for f in fields if item.get(f)]
     return " ".join(parts)
 
 
-def _params_for(endpoint: str, inn: str, limit: int = 1, offset: int = 0) -> dict:
-    """Возвращает параметры запроса под конкретный endpoint."""
+def is_financial_lessor(okved: str, name: str) -> bool:
+    """
+    True если лизингодатель — финансовый посредник
+    (банк, лизинговая компания, страховщик).
+    Таких исключаем из ПУТИ Б.
+    """
+    okved = (okved or "").strip()
+    name_lower = (name or "").lower()
+
+    if any(okved.startswith(p) for p in FINANCIAL_OKVED_PREFIXES):
+        return True
+    if okved in FINANCIAL_OKVED_EXACT:
+        return True
+    if any(kw in name_lower for kw in FINANCIAL_NAME_KEYWORDS):
+        return True
+    # "лизинг" в названии без ОКВЭД 63.x — скорее всего финансовый
+    if "лизинг" in name_lower and not okved.startswith("63."):
+        return True
+    return False
+
+
+def classify_lessor(okved: str, name: str) -> str:
+    """
+    Классифицирует лизингодателя для скоринга.
+    Возвращает: financial | datacenter | energy | realty | other
+    """
+    if is_financial_lessor(okved, name):
+        return "financial"
+    okved = okved or ""
+    if okved.startswith("63."):
+        return "datacenter"
+    if okved.startswith("35."):
+        return "energy"
+    if okved.startswith("68."):
+        return "realty"
+    return "other"
+
+
+def _params_for(endpoint: str, query: str, limit: int = 40, offset: int = 0) -> dict:
     if "efrs-messages" in endpoint:
-        # Актуальный API: параметр "query"
-        return {"query": inn, "limit": limit, "offset": offset}
+        return {"query": query, "limit": limit, "offset": offset}
     elif "backend/search" in endpoint:
-        return {"searchString": inn, "limit": limit, "offset": offset}
+        return {"searchString": query, "limit": limit, "offset": offset}
     else:
-        return {"inn": inn, "limit": limit, "offset": offset}
+        return {"q": query, "limit": limit, "offset": offset}
 
 
-async def _probe_endpoint(
-    client: httpx.AsyncClient, inn: str
-) -> str | None:
+async def _probe_endpoint(client: httpx.AsyncClient, query: str) -> str | None:
     """Перебирает эндпоинты, возвращает рабочий."""
     for ep in FEDRESURS_ENDPOINTS:
         try:
             r = await client.get(
                 ep,
-                params=_params_for(ep, inn),
+                params=_params_for(ep, query, limit=1),
                 headers=_headers(),
                 timeout=20,
             )
@@ -111,24 +205,28 @@ async def _probe_endpoint(
     return None
 
 
-async def _fetch_leasing_by_inn(
+# ════════════════════════════════════════════════════════════════════════════
+# Пагинированный сбор сообщений
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _fetch_pages(
     client: httpx.AsyncClient,
-    inn: str,
+    query: str,
     endpoint: str,
+    max_pages: int = 100,
 ) -> list[dict]:
     """
-    Пагинированный обход сообщений по конкретному ИНН.
+    Пагинированный обход сообщений по запросу (ИНН или ключевое слово).
     """
     results: list[dict] = []
     offset, limit = 0, 40
 
-    while offset < 400:
+    for _ in range(max_pages):
         for attempt in range(MAX_RETRIES):
             try:
-                params: dict[str, Any] = _params_for(endpoint, inn, limit, offset)
                 r = await client.get(
                     endpoint,
-                    params=params,
+                    params=_params_for(endpoint, query, limit, offset),
                     headers=_headers(),
                     timeout=20,
                 )
@@ -138,11 +236,11 @@ async def _fetch_leasing_by_inn(
                     await asyncio.sleep(wait)
                     continue
                 if r.status_code != 200:
-                    log.debug(f"Федресурс HTTP {r.status_code}")
+                    log.debug(f"Федресурс HTTP {r.status_code} для '{query}'")
                     return results
 
-                data  = r.json()
-                items = (
+                data = r.json()
+                items: list[dict] = (
                     data.get("data") or data.get("items") or
                     data.get("content") or data.get("messages") or []
                 )
@@ -154,29 +252,14 @@ async def _fetch_leasing_by_inn(
                 if not items:
                     return results
 
-                for item in items:
-                    # Проверяем тип — нам нужен только лизинг
-                    msg_type = str(item.get("messageType", item.get("type", ""))).lower()
-                    is_leasing = (
-                        "лизинг" in msg_type
-                        or "leasing" in msg_type
-                        or "аренда" in msg_type
-                        or any(t.lower() in msg_type for t in LEASING_MESSAGE_TYPES)
-                    )
-                    # Если тип неизвестен — берём всё (текст проверим в фильтрах)
-                    results.append({
-                        "inn":         _extract_inn(item),
-                        "text":        _extract_leasing_text(item),
-                        "is_leasing":  is_leasing,
-                        "raw":         item,
-                    })
-
+                results.extend(items)
                 offset += limit
+
                 if total and offset >= total:
                     return results
 
                 await asyncio.sleep(_rand_delay())
-                break  # успешная итерация — выходим из retry loop
+                break
 
             except Exception as e:
                 log.debug(f"Федресурс attempt {attempt}: {e}")
@@ -185,11 +268,178 @@ async def _fetch_leasing_by_inn(
     return results
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ПУТЬ А + Б: поиск по ключевым словам
+# ════════════════════════════════════════════════════════════════════════════
+
+async def search_by_keywords(
+    keywords: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Ищет договоры по майнинговым ключевым словам.
+
+    Возвращает:
+        miner_inns:    dict[inn → list[leasing_texts]]  — ПУТЬ А (лизингополучатели)
+        hosting_inns:  dict[inn → dict]                 — ПУТЬ Б (лизингодатели, не финансовые)
+        contracts:     list[dict]                       — все найденные договоры
+        stats:         dict                             — статистика
+    """
+    if keywords is None:
+        keywords = MINING_SEARCH_KEYWORDS
+
+    miner_inns:   dict[str, list[str]] = {}   # inn → [тексты договоров]
+    hosting_inns: dict[str, dict] = {}         # inn → {name, okved, lessor_type}
+    all_contracts: list[dict] = []
+
+    stats = {
+        "keywords_searched":   0,
+        "contracts_found":     0,
+        "lessees_found":       0,
+        "lessors_found":       0,
+        "lessors_financial":   0,
+        "lessors_accepted":    0,
+    }
+
+    transport = _make_transport()
+    async with httpx.AsyncClient(
+        transport=transport,
+        timeout=httpx.Timeout(25.0),
+        follow_redirects=True,
+    ) as client:
+
+        endpoint = await _probe_endpoint(client, keywords[0])
+        if not endpoint:
+            log.warning("Федресурс: ни один эндпоинт не доступен")
+            return {
+                "miner_inns":   miner_inns,
+                "hosting_inns": hosting_inns,
+                "contracts":    all_contracts,
+                "stats":        stats,
+                "error":        "no_endpoint",
+            }
+
+        log.info(f"Федресурс: используем эндпоинт {endpoint}")
+
+        for keyword in keywords:
+            log.info(f"Федресурс: поиск по '{keyword}'")
+            stats["keywords_searched"] += 1
+
+            items = await _fetch_pages(client, keyword, endpoint)
+            stats["contracts_found"] += len(items)
+
+            for item in items:
+                msg_type = str(item.get("messageType", item.get("type", ""))).lower()
+                is_leasing = (
+                    "лизинг" in msg_type
+                    or "leasing" in msg_type
+                    or "аренда" in msg_type
+                    or not msg_type  # тип неизвестен — берём всё
+                )
+                if not is_leasing:
+                    continue
+
+                text = _extract_leasing_text(item)
+
+                # ── ПУТЬ А: лизингополучатель = майнер ──────────────────────
+                lessee_inn = _extract_lessee_inn(item)
+                if lessee_inn:
+                    if lessee_inn not in miner_inns:
+                        miner_inns[lessee_inn] = []
+                        stats["lessees_found"] += 1
+                    if text:
+                        miner_inns[lessee_inn].append(text)
+
+                # ── ПУТЬ Б: лизингодатель = потенциальный хостинг ───────────
+                lessor_inn, lessor_name = _extract_lessor_meta(item)
+                if lessor_inn:
+                    stats["lessors_found"] += 1
+                    lessor_okved = _extract_lessor_okved(item)
+                    lessor_type  = classify_lessor(lessor_okved, lessor_name)
+
+                    if lessor_type == "financial":
+                        stats["lessors_financial"] += 1
+                        log.debug(
+                            f"Пропускаем финансового лизингодателя: "
+                            f"{lessor_name} [{lessor_okved}]"
+                        )
+                    else:
+                        stats["lessors_accepted"] += 1
+                        if lessor_inn not in hosting_inns:
+                            hosting_inns[lessor_inn] = {
+                                "name":        lessor_name,
+                                "okved":       lessor_okved,
+                                "lessor_type": lessor_type,
+                                "keywords":    [],
+                            }
+                        hosting_inns[lessor_inn]["keywords"].append(keyword)
+
+                all_contracts.append({
+                    "keyword":     keyword,
+                    "lessee_inn":  lessee_inn,
+                    "lessor_inn":  lessor_inn,
+                    "lessor_name": lessor_name,
+                    "lessor_type": lessor_type if lessor_inn else "",
+                    "text":        text,
+                })
+
+            await asyncio.sleep(_rand_delay())
+
+    log.info(
+        f"Федресурс keyword-search: "
+        f"договоров={stats['contracts_found']} | "
+        f"майнеров={stats['lessees_found']} | "
+        f"хостингов_принято={stats['lessors_accepted']} | "
+        f"финансовых_отсеяно={stats['lessors_financial']}"
+    )
+
+    return {
+        "miner_inns":   miner_inns,
+        "hosting_inns": hosting_inns,
+        "contracts":    all_contracts,
+        "stats":        stats,
+        "error":        None,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Поиск по конкретному ИНН (обратная совместимость)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def fetch_fedresurs(inn: str) -> dict[str, Any]:
+    """
+    Ищет лизинговые договоры для конкретного ИНН.
+    Сначала пробует HTTP API, при неудаче — Playwright.
+    """
+    result: dict[str, Any] = {
+        "inn":           inn,
+        "leasing_texts": [],
+        "raw_count":     0,
+        "error":         None,
+    }
+
+    transport = _make_transport()
+    async with httpx.AsyncClient(
+        transport=transport,
+        timeout=httpx.Timeout(25.0),
+        follow_redirects=True,
+    ) as client:
+        endpoint = await _probe_endpoint(client, inn)
+        if endpoint:
+            items = await _fetch_pages(client, inn, endpoint)
+            result["raw_count"] = len(items)
+            result["leasing_texts"] = [
+                _extract_leasing_text(i) for i in items
+                if _extract_leasing_text(i).strip()
+            ]
+            log.debug(f"Федресурс {inn}: {len(items)} сообщений via API")
+            return result
+
+    log.info(f"Федресурс {inn}: HTTP API недоступен, fallback на Playwright")
+    return await _fetch_fedresurs_playwright(inn)
+
+
 async def _fetch_fedresurs_playwright(inn: str) -> dict[str, Any]:
-    """
-    Playwright-fallback: загружает страницу компании на fedresurs.ru через браузер.
-    Используется когда HTTP API недоступен (бан, капча, авторизация).
-    """
+    """Playwright-fallback когда HTTP API недоступен."""
     result: dict[str, Any] = {
         "inn": inn, "leasing_texts": [], "raw_count": 0, "error": None,
     }
@@ -213,11 +463,16 @@ async def _fetch_fedresurs_playwright(inn: str) -> dict[str, Any]:
             viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,css}", lambda r: r.abort())
+        await page.route(
+            "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,css}",
+            lambda r: r.abort(),
+        )
 
         search_url = f"https://fedresurs.ru/search/entities?searchString={inn}"
         try:
-            await page.goto(search_url, timeout=PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.goto(
+                search_url, timeout=PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded"
+            )
         except Exception as e:
             result["error"] = str(e)
             await browser.close()
@@ -225,23 +480,28 @@ async def _fetch_fedresurs_playwright(inn: str) -> dict[str, Any]:
 
         await asyncio.sleep(random.uniform(2.0, 4.0))
 
-        # Ищем ссылку на карточку компании
         company_link = None
         try:
-            link_el = await page.query_selector(".company-name a, .search-result a, h3 > a")
+            link_el = await page.query_selector(
+                ".company-name a, .search-result a, h3 > a"
+            )
             if link_el:
                 href = await link_el.get_attribute("href")
                 if href:
-                    company_link = href if href.startswith("http") else "https://fedresurs.ru" + href
+                    company_link = (
+                        href if href.startswith("http")
+                        else "https://fedresurs.ru" + href
+                    )
         except Exception:
             pass
 
         if not company_link:
-            # Пробуем прямой URL по ИНН
             company_link = f"https://fedresurs.ru/company/{inn}"
 
         try:
-            await page.goto(company_link, timeout=PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.goto(
+                company_link, timeout=PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded"
+            )
         except Exception as e:
             result["error"] = str(e)
             await browser.close()
@@ -249,13 +509,14 @@ async def _fetch_fedresurs_playwright(inn: str) -> dict[str, Any]:
 
         await asyncio.sleep(random.uniform(2.0, 3.0))
 
-        # Ищем сообщения о лизинге в тексте страницы
         try:
             full_text = await page.inner_text("body")
-            lines = [l.strip() for l in full_text.splitlines() if l.strip()]
-            for line in lines:
-                line_low = line.lower()
-                if any(kw in line_low for kw in ["лизинг", "аренда", "leasing", "финансовая аренда"]):
+            for line in full_text.splitlines():
+                line = line.strip()
+                if line and any(
+                    kw in line.lower()
+                    for kw in ["лизинг", "аренда", "leasing", "финансовая аренда"]
+                ):
                     leasing_texts.append(line)
         except Exception as e:
             log.debug(f"Федресурс playwright текст {inn}: {e}")
@@ -266,35 +527,3 @@ async def _fetch_fedresurs_playwright(inn: str) -> dict[str, Any]:
     result["raw_count"] = len(leasing_texts)
     log.debug(f"Федресурс playwright {inn}: {len(leasing_texts)} строк с лизингом")
     return result
-
-
-async def fetch_fedresurs(inn: str) -> dict[str, Any]:
-    """
-    Ищет лизинговые договоры для ИНН на Федресурсе.
-    Сначала пробует HTTP API, при неудаче — Playwright.
-    Возвращает: {"inn": ..., "leasing_texts": [...], "raw_count": N}
-    """
-    result: dict[str, Any] = {
-        "inn":           inn,
-        "leasing_texts": [],
-        "raw_count":     0,
-        "error":         None,
-    }
-
-    transport = _make_transport()
-    async with httpx.AsyncClient(
-        transport=transport,
-        timeout=httpx.Timeout(25.0),
-        follow_redirects=True,
-    ) as client:
-        endpoint = await _probe_endpoint(client, inn)
-        if endpoint:
-            items = await _fetch_leasing_by_inn(client, inn, endpoint)
-            result["raw_count"] = len(items)
-            result["leasing_texts"] = [i["text"] for i in items if i["text"].strip()]
-            log.debug(f"Федресурс {inn}: {len(items)} сообщений via API")
-            return result
-
-    # HTTP API недоступен — пробуем Playwright
-    log.info(f"Федресурс {inn}: HTTP API недоступен, fallback на Playwright")
-    return await _fetch_fedresurs_playwright(inn)
