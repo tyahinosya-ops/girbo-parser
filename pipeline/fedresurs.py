@@ -383,24 +383,101 @@ async def _fetch_pages(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Playwright-стратегия: обход Qrator через браузерный fetch
+# Playwright-стратегия: один браузер на все ключевые слова
 # ════════════════════════════════════════════════════════════════════════════
 
-async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dict]:
+async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> list[dict]:
     """
-    Делает запросы к /encumbrances из браузерного контекста Playwright.
-    Браузер проходит Qrator-challenge при загрузке главной страницы,
-    после чего fetch()-вызовы идут уже с правильными куками.
+    Выбирает все страницы по одному ключевому слову через браузерный fetch.
+    Браузер уже прошёл Qrator — куки есть.
+    """
+    import urllib.parse
+    kw_enc = urllib.parse.quote(keyword)
+    seen_ids: set = set()
+    results: list[dict] = []
+
+    for page_num in range(max_pages):
+        offset = page_num * PAGE_SIZE
+        api_path = (
+            f"/backend/encumbrances"
+            f"?searchString={kw_enc}"
+            f"&limit={PAGE_SIZE}&offset={offset}"
+        )
+        try:
+            data = await page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const r = await fetch('{api_path}', {{
+                            headers: {{
+                                'Accept': 'application/json, text/plain, */*',
+                                'Referer': '{BASE}/',
+                                'X-Requested-With': 'XMLHttpRequest',
+                            }}
+                        }});
+                        if (!r.ok) return {{ _error: r.status }};
+                        return await r.json();
+                    }} catch(e) {{
+                        return {{ _error: e.message }};
+                    }}
+                }}
+            """)
+        except Exception as e:
+            log.debug(f"Playwright eval '{keyword}' стр.{page_num}: {e}")
+            break
+
+        if not data or (isinstance(data, dict) and data.get("_error")):
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: ошибка {data}")
+            break
+
+        items, total = _detect_items(data)
+        if not items:
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: пусто (total={total})")
+            break
+
+        new_items = []
+        for item in items:
+            item_id = (
+                item.get("number") or item.get("guid") or item.get("id") or
+                f"{item.get('publishDate','')[:10]}_{item.get('type','')}"
+            )
+            if item_id not in seen_ids:
+                seen_ids.add(item_id)
+                new_items.append(item)
+
+        if not new_items:
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: все дубли — стоп")
+            break
+
+        results.extend(new_items)
+        log.debug(
+            f"Playwright '{keyword}': стр.{page_num} "
+            f"+{len(new_items)} (всего {len(results)}, total API={total})"
+        )
+
+        if total and (offset + PAGE_SIZE) >= total:
+            break
+
+        await asyncio.sleep(_rand_delay())
+
+    return results
+
+
+async def _search_all_keywords_playwright(
+    keywords: list[str], max_pages: int = 50
+) -> dict[str, list[dict]]:
+    """
+    Один браузер — один Qrator-challenge — все ключевые слова.
+    Возвращает {keyword: [items...]}.
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         log.error("playwright не установлен")
-        return []
+        return {}
 
     from config import PLAYWRIGHT_HEADLESS
 
-    results: list[dict] = []
+    result: dict[str, list[dict]] = {}
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -427,7 +504,7 @@ async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dic
         """)
         page = await context.new_page()
 
-        # Загружаем главную — Qrator выдаёт куку после PoW-challenge
+        # Один раз проходим Qrator
         log.info(f"Playwright: загружаем {BASE}/ (Qrator challenge) ...")
         try:
             await page.goto(BASE + "/", wait_until="domcontentloaded", timeout=30_000)
@@ -435,89 +512,25 @@ async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dic
         except Exception as e:
             log.warning(f"Playwright homepage: {e}")
             await browser.close()
-            return []
+            return {}
 
         if "qrerror" in page.url or "403" in str(page.url):
             log.warning("Playwright: Qrator вернул 403 — нужна residential прокси")
             await browser.close()
-            return []
+            return {}
 
-        log.info(f"Playwright: страница загружена ({page.url}), начинаем fetch к /backend/encumbrances")
+        log.info(f"Playwright: сессия открыта, обрабатываем {len(keywords)} ключевых слов")
 
-        seen_ids: set = set()
-
-        # После прохождения Qrator делаем прямые fetch к /backend/encumbrances
-        # из браузерного контекста (у него уже есть нужные куки)
-        import urllib.parse
-        kw_enc = urllib.parse.quote(keyword)
-
-        for page_num in range(max_pages):
-            offset = page_num * PAGE_SIZE
-            api_path = (
-                f"/backend/encumbrances"
-                f"?searchString={kw_enc}"
-                f"&limit={PAGE_SIZE}&offset={offset}"
-            )
-            try:
-                data = await page.evaluate(f"""
-                    async () => {{
-                        try {{
-                            const r = await fetch('{api_path}', {{
-                                headers: {{
-                                    'Accept': 'application/json, text/plain, */*',
-                                    'Referer': '{BASE}/',
-                                    'X-Requested-With': 'XMLHttpRequest',
-                                }}
-                            }});
-                            if (!r.ok) return {{ _error: r.status }};
-                            return await r.json();
-                        }} catch(e) {{
-                            return {{ _error: e.message }};
-                        }}
-                    }}
-                """)
-            except Exception as e:
-                log.debug(f"Playwright eval '{keyword}' стр.{page_num}: {e}")
-                break
-
-            if not data or (isinstance(data, dict) and data.get("_error")):
-                log.debug(f"Playwright '{keyword}' стр.{page_num}: ошибка {data}")
-                break
-
-            items, total = _detect_items(data)
-            if not items:
-                log.debug(f"Playwright '{keyword}' стр.{page_num}: пусто (total={total})")
-                break
-
-            new_items = []
-            for item in items:
-                item_id = (
-                    item.get("number") or item.get("guid") or
-                    item.get("id") or
-                    f"{item.get('publishDate','')[:10]}_{str(item.get('type',''))}"
-                )
-                if item_id not in seen_ids:
-                    seen_ids.add(item_id)
-                    new_items.append(item)
-
-            if not new_items:
-                log.debug(f"Playwright '{keyword}' стр.{page_num}: все дубли — стоп")
-                break
-
-            results.extend(new_items)
-            log.debug(
-                f"Playwright '{keyword}': стр.{page_num} "
-                f"+{len(new_items)} (всего {len(results)}, total API={total})"
-            )
-
-            if total and (offset + PAGE_SIZE) >= total:
-                break
-
+        for keyword in keywords:
+            log.info(f"Playwright: поиск по '{keyword}'")
+            items = await _pw_fetch_keyword(page, keyword, max_pages)
+            result[keyword] = items
+            log.info(f"Playwright '{keyword}': найдено {len(items)} записей")
             await asyncio.sleep(_rand_delay())
 
         await browser.close()
 
-    return results
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -552,7 +565,11 @@ async def search_by_keywords(
         "lessors_accepted":    0,
     }
 
+    # Пробуем httpx (быстро, если есть прокси или не заблокирован)
+    # При блокировке (451/403/no_endpoint) — один Playwright-браузер на все ключевые слова
     transport = _make_transport()
+    keyword_items: dict[str, list[dict]] = {}  # keyword → items
+
     async with httpx.AsyncClient(
         transport=transport,
         timeout=httpx.Timeout(25.0),
@@ -561,25 +578,35 @@ async def search_by_keywords(
 
         xsrf = await _init_session(client)
         endpoint = await _probe_endpoints(client, xsrf)
-        use_playwright = endpoint is None  # httpx заблокирован Qrator
 
-        if use_playwright:
-            log.info("Федресурс: httpx заблокирован — переключаемся на Playwright")
-        else:
+        if endpoint:
             method, path, param, extra = endpoint
-            log.info(f"Федресурс: используем эндпоинт {method} {path} ?{param}")
-
-        for keyword in keywords:
-            log.info(f"Федресурс: поиск по '{keyword}'")
-            stats["keywords_searched"] += 1
-
-            if use_playwright:
-                items = await _fetch_pages_playwright(keyword)
-            else:
+            log.info(f"Федресурс: httpx работает → {method} {path}")
+            blocked = False
+            for keyword in keywords:
+                if blocked:
+                    break
+                log.info(f"Федресурс httpx: поиск по '{keyword}'")
                 items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
-            stats["contracts_found"] += len(items)
+                # Если вернулось пусто — возможно, блокировка началась в процессе
+                keyword_items[keyword] = items
+        else:
+            log.info("Федресурс: httpx недоступен (Qrator 451/404) → Playwright")
 
-            for item in items:
+    # Ключевые слова без результатов — через Playwright
+    missing = [kw for kw in keywords if not keyword_items.get(kw)]
+    if missing:
+        log.info(f"Федресурс: Playwright для {len(missing)} ключевых слов")
+        pw_results = await _search_all_keywords_playwright(missing)
+        keyword_items.update(pw_results)
+
+    # Обрабатываем все собранные записи
+    for keyword in keywords:
+        items = keyword_items.get(keyword, [])
+        stats["keywords_searched"] += 1
+        stats["contracts_found"] += len(items)
+
+        for item in items:
                 msg_type = str(item.get("messageType", item.get("type", ""))).lower()
                 is_leasing = (
                     "лизинг" in msg_type
@@ -636,8 +663,6 @@ async def search_by_keywords(
                     "lessor_type": lessor_type if lessor_inn else "",
                     "text":        text,
                 })
-
-            await asyncio.sleep(_rand_delay())
 
     log.info(
         f"Федресурс keyword-search: "
