@@ -460,38 +460,21 @@ async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dic
 
         for page_num in range(max_pages):
             # Первая страница — навигация на encumbrances (SPA загрузит данные сама)
-            if page_num == 0:
-                import urllib.parse
-                kw_enc = urllib.parse.quote(keyword)
-                nav_url = (
-                    f"{BASE}/encumbrances"
-                    f"?searchString={kw_enc}"
-                    f"&group=all&period=%7B%7D&additionalFnpSearch=true"
-                    f"&limit={PAGE_SIZE}&offset=0"
-                )
-                try:
-                    await page.goto(nav_url, wait_until="networkidle", timeout=20_000)
-                except Exception:
-                    await asyncio.sleep(3)
-            else:
-                # Последующие страницы — меняем offset через URL
-                if not real_api_url:
-                    break
-                import urllib.parse
-                kw_enc = urllib.parse.quote(keyword)
-                offset = page_num * PAGE_SIZE
-                nav_url = (
-                    f"{BASE}/encumbrances"
-                    f"?searchString={kw_enc}"
-                    f"&group=all&period=%7B%7D&additionalFnpSearch=true"
-                    f"&limit={PAGE_SIZE}&offset={offset}"
-                )
-                try:
-                    await page.goto(nav_url, wait_until="networkidle", timeout=20_000)
-                except Exception:
-                    await asyncio.sleep(3)
-
-            await asyncio.sleep(2)
+            import urllib.parse
+            kw_enc = urllib.parse.quote(keyword)
+            offset = page_num * PAGE_SIZE
+            nav_url = (
+                f"{BASE}/encumbrances"
+                f"?searchString={kw_enc}"
+                f"&group=all&period=%7B%7D&additionalFnpSearch=true"
+                f"&limit={PAGE_SIZE}&offset={offset}"
+            )
+            try:
+                await page.goto(nav_url, wait_until="domcontentloaded", timeout=20_000)
+            except Exception as e:
+                log.debug(f"Playwright nav '{keyword}' стр.{page_num}: {e}")
+            # Даём SPA время загрузить данные и сделать XHR
+            await asyncio.sleep(5)
 
             if not intercepted:
                 log.debug(f"Playwright '{keyword}' стр.{page_num}: нет JSON-ответов")
