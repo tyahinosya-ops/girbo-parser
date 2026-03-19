@@ -76,7 +76,7 @@ MAX_RETRIES: int = 3
 ENRICHMENT_CONCURRENCY: int = 5  # сколько ИНН обогащаем параллельно
 
 # ── Playwright ──────────────────────────────────────────────────────────────
-PLAYWRIGHT_HEADLESS: bool = True
+PLAYWRIGHT_HEADLESS: bool = False  # False = обходим Qrator (headless детектируется)
 PLAYWRIGHT_TIMEOUT_MS: int = 30_000
 
 USER_AGENTS: list[str] = [

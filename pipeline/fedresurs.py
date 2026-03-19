@@ -504,11 +504,11 @@ async def _search_all_keywords_playwright(
         """)
         page = await context.new_page()
 
-        # Один раз проходим Qrator
+        # Шаг 1: главная страница — Qrator PoW-challenge
         log.info(f"Playwright: загружаем {BASE}/ (Qrator challenge) ...")
         try:
             await page.goto(BASE + "/", wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(6)
+            await asyncio.sleep(5)
         except Exception as e:
             log.warning(f"Playwright homepage: {e}")
             await browser.close()
@@ -519,7 +519,20 @@ async def _search_all_keywords_playwright(
             await browser.close()
             return {}
 
-        log.info(f"Playwright: сессия открыта, обрабатываем {len(keywords)} ключевых слов")
+        # Шаг 2: прогрев — навигация на SPA /encumbrances
+        # Qrator проверяет историю навигации перед разрешением API-запросов
+        log.info("Playwright: прогрев сессии (навигация на /encumbrances) ...")
+        try:
+            await page.goto(
+                BASE + "/encumbrances?searchString=antminer&group=all&period=%7B%7D&additionalFnpSearch=true&limit=15&offset=0",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            await asyncio.sleep(8)  # даём SPA загрузиться и сделать свои запросы
+        except Exception as e:
+            log.warning(f"Playwright warmup: {e}")
+
+        log.info(f"Playwright: сессия прогрета ({page.url}), обрабатываем {len(keywords)} ключевых слов")
 
         for keyword in keywords:
             log.info(f"Playwright: поиск по '{keyword}'")
