@@ -302,9 +302,12 @@ async def run_fedresurs_pipeline(
         if inn in miner_inns_map:
             company.setdefault("leasing_texts", []).extend(miner_inns_map[inn])
 
-        # Тип лизингодателя (для бонуса хостингов)
+        # Тип лизингодателя + тексты из договоров (для хостингов — Путь Б)
         if inn in hosting_inns_map:
             company["lessor_type"] = hosting_inns_map[inn].get("lessor_type", "")
+            company.setdefault("leasing_texts", []).extend(
+                hosting_inns_map[inn].get("texts", [])
+            )
 
         # Пометка пути
         paths = []

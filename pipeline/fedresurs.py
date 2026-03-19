@@ -455,8 +455,11 @@ async def search_by_keywords(
                                 "okved":       lessor_okved,
                                 "lessor_type": lessor_type,
                                 "keywords":    [],
+                                "texts":       [],
                             }
                         hosting_inns[lessor_inn]["keywords"].append(keyword)
+                        if text:
+                            hosting_inns[lessor_inn]["texts"].append(text)
 
                 all_contracts.append({
                     "keyword":     keyword,
