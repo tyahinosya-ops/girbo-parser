@@ -27,22 +27,15 @@ BASE = "https://fedresurs.ru"
 PAGE_SIZE = 40
 
 # Эндпоинты в порядке приоритета: (метод, путь, параметр_поиска, доп_параметры)
-# /encumbrances — актуальный эндпоинт (найден 19 марта 2026 через DevTools)
-# /backend/sfacts — 404 с марта 2026
+# /backend/encumbrances — актуальный эндпоинт (подтверждён 19 марта 2026 через DevTools)
+# Возвращает: {"pageData": [...], "found": N}
+# weakSide: [{role: "Lessee"|"Lessor", inn: "...", name: "..."}]
 FEDRESURS_ENDPOINTS: list[tuple[str, str, str, dict]] = [
-    ("GET", "/encumbrances", "searchString", {
-        "group": "all",
-        "period": "{}",
-        "additionalFnpSearch": "true",
-    }),
-    # Резервные варианты
+    ("GET", "/backend/encumbrances",   "searchString", {}),  # ← актуальный
+    # Резервные (старые или альтернативные)
     ("GET",  "/api/sfacts",            "searchString", {}),
     ("GET",  "/api/v1/sfacts",         "searchString", {}),
-    ("GET",  "/api/search",            "searchString", {}),
-    ("POST", "/api/sfacts/search",     "searchString", {}),
-    # Старые пути (до марта 2026)
     ("GET",  "/backend/sfacts",        "searchString", {}),
-    ("GET",  "/backend/search",        "searchString", {}),
     ("POST", "/backend/sfacts",        "searchString", {}),
 ]
 
@@ -124,15 +117,21 @@ def _detect_items(data: dict | list) -> tuple[list, int]:
         return data, len(data)
     if not isinstance(data, dict):
         return [], 0
+    # Актуальная структура Федресурса: {pageData: [...], found: N}
+    if "pageData" in data:
+        items = data["pageData"] if isinstance(data["pageData"], list) else []
+        total = int(data.get("found", len(items)))
+        return items, total
+    # Generic fallback
     for val in data.values():
         if isinstance(val, list) and len(val) > 0:
             total = 0
-            for tkey in ("total", "totalCount", "totalElements", "count", "size"):
+            for tkey in ("total", "totalCount", "totalElements", "count", "size", "found"):
                 if data.get(tkey):
                     total = int(data[tkey])
                     break
             return val, total or len(val)
-    for tkey in ("total", "totalCount", "totalElements", "count", "size"):
+    for tkey in ("total", "totalCount", "totalElements", "count", "size", "found"):
         if data.get(tkey) and int(data[tkey]) > 0:
             return [], int(data[tkey])
     return [], 0
@@ -152,28 +151,49 @@ def _extract_inn(item: dict, fields: tuple[str, ...]) -> str:
     return m.group(1) if m else ""
 
 
+_LESSEE_ROLES = {"Lessee", "Debtor", "Borrower", "Pledgor"}
+_LESSOR_ROLES = {"Lessor", "Creditor", "Lender", "Pledgee", "StrongSide", "Owner"}
+
+
 def _extract_lessee_inn(item: dict) -> str:
-    """ИНН лизингополучателя (ПУТЬ А — майнеры)."""
+    """ИНН лизингополучателя (ПУТЬ А — майнеры).
+    Новая структура: weakSide[{role: 'Lessee', inn: '...'}]
+    """
+    for party in item.get("weakSide", []):
+        if party.get("role") in _LESSEE_ROLES and not party.get("isHidden", False):
+            inn = str(party.get("inn", "")).strip()
+            if re.fullmatch(r"\d{10,12}", inn):
+                return inn
+    # Fallback: старые поля
     return _extract_inn(item, (
-        "lesseeInn", "debtorInn", "entityInn",
-        "participantInn", "companyInn", "inn",
+        "lesseeInn", "debtorInn", "entityInn", "participantInn", "companyInn", "inn",
     ))
 
 
 def _extract_lessor_inn(item: dict) -> str:
     """ИНН лизингодателя (ПУТЬ Б — хостинги)."""
+    for party in item.get("weakSide", []):
+        if party.get("role") in _LESSOR_ROLES and not party.get("isHidden", False):
+            inn = str(party.get("inn", "")).strip()
+            if re.fullmatch(r"\d{10,12}", inn):
+                return inn
     return _extract_inn(item, (
-        "lessorInn", "creditorInn", "lenderInn",
-        "counterpartyInn", "ownerInn",
+        "lessorInn", "creditorInn", "lenderInn", "counterpartyInn", "ownerInn",
     ))
 
 
 def _extract_lessor_meta(item: dict) -> tuple[str, str]:
     """Возвращает (ИНН лизингодателя, название лизингодателя)."""
+    for party in item.get("weakSide", []):
+        if party.get("role") in _LESSOR_ROLES and not party.get("isHidden", False):
+            inn = str(party.get("inn", "")).strip()
+            name = str(party.get("name", "")).strip()
+            if re.fullmatch(r"\d{10,12}", inn):
+                return inn, name
+    # Fallback
     inn = _extract_lessor_inn(item)
     name = str(item.get(
-        "lessorName",
-        item.get("creditorName", item.get("counterpartyName", ""))
+        "lessorName", item.get("creditorName", item.get("counterpartyName", ""))
     )).strip()
     return inn, name
 
@@ -422,87 +442,79 @@ async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dic
             await browser.close()
             return []
 
-        log.info(f"Playwright: страница загружена ({page.url}), начинаем перехват API")
+        log.info(f"Playwright: страница загружена ({page.url}), начинаем fetch к /backend/encumbrances")
 
         seen_ids: set = set()
 
-        # /encumbrances — это SPA-роут, реальный API вызывается браузером.
-        # Перехватываем JSON-ответы и параллельно пробуем backend-пути напрямую.
-        intercepted: list[dict] = []
-        real_api_url: list[str] = []  # обнаруженный backend-URL
-
-        async def _on_response(response):
-            url = response.url
-            if "fedresurs.ru" not in url:
-                return
-            skip = (".js", ".css", ".png", ".woff", ".ico", "yandex", "favicon",
-                    "settings", "clientApp", "yandexMetrics")
-            if any(s in url for s in skip):
-                return
-            ct = response.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            try:
-                body = await response.json()
-                items, total = _detect_items(body)
-                if items or total:
-                    intercepted.append(body)
-                    if not real_api_url:
-                        # Запоминаем путь без query-параметров для повторных запросов
-                        from urllib.parse import urlparse
-                        parsed = urlparse(url)
-                        real_api_url.append(parsed.path)
-                        log.info(f"Playwright: обнаружен backend API → {parsed.path}")
-            except Exception:
-                pass
-
-        page.on("response", _on_response)
+        # После прохождения Qrator делаем прямые fetch к /backend/encumbrances
+        # из браузерного контекста (у него уже есть нужные куки)
+        import urllib.parse
+        kw_enc = urllib.parse.quote(keyword)
 
         for page_num in range(max_pages):
-            # Первая страница — навигация на encumbrances (SPA загрузит данные сама)
-            import urllib.parse
-            kw_enc = urllib.parse.quote(keyword)
             offset = page_num * PAGE_SIZE
-            nav_url = (
-                f"{BASE}/encumbrances"
+            api_path = (
+                f"/backend/encumbrances"
                 f"?searchString={kw_enc}"
-                f"&group=all&period=%7B%7D&additionalFnpSearch=true"
                 f"&limit={PAGE_SIZE}&offset={offset}"
             )
             try:
-                await page.goto(nav_url, wait_until="domcontentloaded", timeout=20_000)
+                data = await page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const r = await fetch('{api_path}', {{
+                                headers: {{
+                                    'Accept': 'application/json, text/plain, */*',
+                                    'Referer': '{BASE}/',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                }}
+                            }});
+                            if (!r.ok) return {{ _error: r.status }};
+                            return await r.json();
+                        }} catch(e) {{
+                            return {{ _error: e.message }};
+                        }}
+                    }}
+                """)
             except Exception as e:
-                log.debug(f"Playwright nav '{keyword}' стр.{page_num}: {e}")
-            # Даём SPA время загрузить данные и сделать XHR
-            await asyncio.sleep(5)
-
-            if not intercepted:
-                log.debug(f"Playwright '{keyword}' стр.{page_num}: нет JSON-ответов")
+                log.debug(f"Playwright eval '{keyword}' стр.{page_num}: {e}")
                 break
 
-            for body in intercepted:
-                items, total = _detect_items(body)
-                new_items = []
-                for item in items:
-                    item_id = (
-                        item.get("id") or item.get("guid") or
-                        item.get("number") or
-                        f"{item.get('date','')}_{str(item.get('subject',''))[:40]}"
-                    )
-                    if item_id not in seen_ids:
-                        seen_ids.add(item_id)
-                        new_items.append(item)
-                results.extend(new_items)
-                if new_items:
-                    log.debug(
-                        f"Playwright '{keyword}': стр.{page_num} "
-                        f"+{len(new_items)} (всего {len(results)})"
-                    )
-            intercepted.clear()
+            if not data or (isinstance(data, dict) and data.get("_error")):
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: ошибка {data}")
+                break
+
+            items, total = _detect_items(data)
+            if not items:
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: пусто (total={total})")
+                break
+
+            new_items = []
+            for item in items:
+                item_id = (
+                    item.get("number") or item.get("guid") or
+                    item.get("id") or
+                    f"{item.get('publishDate','')[:10]}_{str(item.get('type',''))}"
+                )
+                if item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    new_items.append(item)
+
+            if not new_items:
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: все дубли — стоп")
+                break
+
+            results.extend(new_items)
+            log.debug(
+                f"Playwright '{keyword}': стр.{page_num} "
+                f"+{len(new_items)} (всего {len(results)}, total API={total})"
+            )
+
+            if total and (offset + PAGE_SIZE) >= total:
+                break
 
             await asyncio.sleep(_rand_delay())
 
-        page.remove_listener("response", _on_response)
         await browser.close()
 
     return results
