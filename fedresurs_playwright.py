@@ -78,17 +78,25 @@ async def search_keyword_playwright(page: Page, keyword: str) -> list[dict]:
     results: list[dict] = []
     intercepted: list[dict] = []
 
-    # Перехватываем все XHR/fetch запросы к /backend/
+    # Перехватываем все XHR/fetch запросы — ищем реальный API
+    _API_HINTS = ("/backend/", "/api/", "/sfacts", "/search", "/messages")
+
     async def handle_response(response):
-        if "/backend/" in response.url and response.status == 200:
-            try:
-                ct = response.headers.get("content-type", "")
-                if "json" in ct:
-                    body = await response.json()
-                    if isinstance(body, (list, dict)):
-                        intercepted.append({"url": response.url, "body": body})
-            except Exception:
-                pass
+        if response.status != 200:
+            return
+        url = response.url
+        if "fedresurs.ru" not in url:
+            return
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            body = await response.json()
+            if isinstance(body, (list, dict)):
+                intercepted.append({"url": url, "body": body})
+                log.info(f"  [API перехват] {url}")
+        except Exception:
+            pass
 
     page.on("response", handle_response)
 

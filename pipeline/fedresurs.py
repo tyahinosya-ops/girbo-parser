@@ -27,14 +27,24 @@ BASE = "https://fedresurs.ru"
 PAGE_SIZE = 40
 
 # Эндпоинты в порядке приоритета (метод, путь, параметр поиска)
+# /backend/sfacts → 404 с марта 2026. Добавлены /api/* кандидаты.
 FEDRESURS_ENDPOINTS: list[tuple[str, str, str]] = [
-    ("GET",  "/backend/sfacts",        "searchString"),
-    ("GET",  "/backend/sfacts",        "query"),
-    ("GET",  "/backend/sfacts",        "q"),
-    ("GET",  "/backend/search",        "searchString"),
-    ("GET",  "/backend/messages",      "searchString"),
-    ("POST", "/backend/sfacts/search", "searchString"),
-    ("POST", "/backend/sfacts",        "searchString"),
+    # /api/* — вероятные новые пути после переезда
+    ("GET",  "/api/sfacts",              "searchString"),
+    ("GET",  "/api/v1/sfacts",           "searchString"),
+    ("GET",  "/api/v2/sfacts",           "searchString"),
+    ("GET",  "/api/search",              "searchString"),
+    ("GET",  "/api/messages",            "searchString"),
+    ("GET",  "/api/sfacts",              "query"),
+    ("POST", "/api/sfacts/search",       "searchString"),
+    ("POST", "/api/sfacts",              "searchString"),
+    ("POST", "/api/search",              "searchString"),
+    # /backend/* — старые пути (были рабочими до марта 2026)
+    ("GET",  "/backend/sfacts",          "searchString"),
+    ("GET",  "/backend/search",          "searchString"),
+    ("GET",  "/backend/messages",        "searchString"),
+    ("POST", "/backend/sfacts/search",   "searchString"),
+    ("POST", "/backend/sfacts",          "searchString"),
 ]
 
 LEASING_MESSAGE_TYPES = [
