@@ -363,6 +363,137 @@ async def _fetch_pages(
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Playwright-стратегия: обход Qrator через браузерный fetch
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dict]:
+    """
+    Делает запросы к /encumbrances из браузерного контекста Playwright.
+    Браузер проходит Qrator-challenge при загрузке главной страницы,
+    после чего fetch()-вызовы идут уже с правильными куками.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log.error("playwright не установлен")
+        return []
+
+    from config import PLAYWRIGHT_HEADLESS
+
+    results: list[dict] = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=PLAYWRIGHT_HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+            ],
+        )
+        context = await browser.new_context(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            user_agent=random.choice(USER_AGENTS),
+            viewport={"width": 1280, "height": 800},
+            extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9"},
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru']});
+            window.chrome = { runtime: {} };
+        """)
+        page = await context.new_page()
+
+        # Загружаем главную — Qrator выдаёт куку после PoW-challenge
+        log.info(f"Playwright: загружаем {BASE}/ (Qrator challenge) ...")
+        try:
+            await page.goto(BASE + "/", wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(6)
+        except Exception as e:
+            log.warning(f"Playwright homepage: {e}")
+            await browser.close()
+            return []
+
+        if "qrerror" in page.url or "403" in str(page.url):
+            log.warning("Playwright: Qrator вернул 403 — нужна residential прокси")
+            await browser.close()
+            return []
+
+        log.info(f"Playwright: страница загружена ({page.url}), начинаем fetch-цикл")
+
+        offset = 0
+        seen_ids: set = set()
+
+        for page_num in range(max_pages):
+            api_path = (
+                f"/encumbrances"
+                f"?searchString={keyword}"
+                f"&group=all&period=%7B%7D&additionalFnpSearch=true"
+                f"&limit={PAGE_SIZE}&offset={offset}"
+            )
+            try:
+                data = await page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const r = await fetch('{api_path}', {{
+                                headers: {{
+                                    'Accept': 'application/json, text/plain, */*',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'Referer': '{BASE}/',
+                                }}
+                            }});
+                            if (!r.ok) return {{ _error: r.status }};
+                            return r.json();
+                        }} catch(e) {{ return {{ _error: e.message }}; }}
+                    }}
+                """)
+
+                if not data or (isinstance(data, dict) and data.get("_error")):
+                    log.debug(f"Playwright '{keyword}' стр.{page_num}: {data}")
+                    break
+
+                items, total = _detect_items(data)
+                if not items:
+                    break
+
+                new_items = []
+                for item in items:
+                    item_id = (
+                        item.get("id") or item.get("guid") or
+                        item.get("number") or
+                        f"{item.get('date','')}_{str(item.get('subject',''))[:40]}"
+                    )
+                    if item_id not in seen_ids:
+                        seen_ids.add(item_id)
+                        new_items.append(item)
+
+                if not new_items:
+                    break
+
+                results.extend(new_items)
+                log.debug(
+                    f"Playwright '{keyword}': стр.{page_num} "
+                    f"+{len(new_items)} (всего {len(results)})"
+                )
+                offset += PAGE_SIZE
+                if total and offset >= total:
+                    break
+
+                await asyncio.sleep(_rand_delay())
+
+            except Exception as e:
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: {e}")
+                break
+
+        await browser.close()
+
+    return results
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # ПУТЬ А + Б: поиск по ключевым словам
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -403,24 +534,22 @@ async def search_by_keywords(
 
         xsrf = await _init_session(client)
         endpoint = await _probe_endpoints(client, xsrf)
-        if not endpoint:
-            log.warning("Федресурс: ни один эндпоинт не доступен")
-            return {
-                "miner_inns":   miner_inns,
-                "hosting_inns": hosting_inns,
-                "contracts":    all_contracts,
-                "stats":        stats,
-                "error":        "no_endpoint",
-            }
+        use_playwright = endpoint is None  # httpx заблокирован Qrator
 
-        method, path, param, extra = endpoint
-        log.info(f"Федресурс: используем эндпоинт {method} {path} ?{param}")
+        if use_playwright:
+            log.info("Федресурс: httpx заблокирован — переключаемся на Playwright")
+        else:
+            method, path, param, extra = endpoint
+            log.info(f"Федресурс: используем эндпоинт {method} {path} ?{param}")
 
         for keyword in keywords:
             log.info(f"Федресурс: поиск по '{keyword}'")
             stats["keywords_searched"] += 1
 
-            items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
+            if use_playwright:
+                items = await _fetch_pages_playwright(keyword)
+            else:
+                items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
             stats["contracts_found"] += len(items)
 
             for item in items:
