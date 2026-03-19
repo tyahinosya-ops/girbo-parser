@@ -388,8 +388,10 @@ async def _fetch_pages(
 
 async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> list[dict]:
     """
-    Выбирает все страницы по одному ключевому слову через браузерный fetch.
-    Браузер уже прошёл Qrator — куки есть.
+    Navigate-and-intercept: навигируем на SPA-страницу и перехватываем
+    естественный XHR-вызов Angular → /backend/encumbrances.
+    Этот подход работает (подтверждён intercept_log.json).
+    page.evaluate(fetch(...)) блокируется Qrator, а SPA-запрос — нет.
     """
     import urllib.parse
     kw_enc = urllib.parse.quote(keyword)
@@ -398,48 +400,52 @@ async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> lis
 
     for page_num in range(max_pages):
         offset = page_num * PAGE_SIZE
-        api_path = (
-            f"/backend/encumbrances"
+
+        # Готовим перехват до навигации
+        captured: list[dict] = []
+        capture_event = asyncio.Event()
+
+        async def handle_response(response: Any) -> None:
+            if (
+                "/backend/encumbrances" in response.url
+                and "searchString=" in response.url
+                and response.status == 200
+                and not captured  # берём только первый ответ
+            ):
+                try:
+                    data = await response.json()
+                    if isinstance(data, dict) and "pageData" in data:
+                        captured.append(data)
+                        capture_event.set()
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+
+        spa_url = (
+            f"{BASE}/encumbrances"
             f"?searchString={kw_enc}"
+            f"&group=all&period=%7B%7D&additionalFnpSearch=true"
             f"&limit={PAGE_SIZE}&offset={offset}"
         )
+
         try:
-            data = await page.evaluate(f"""
-                async () => {{
-                    try {{
-                        // Читаем XSRF-TOKEN из cookies (Angular CSRF-защита)
-                        const xsrfCookie = document.cookie.split('; ')
-                            .find(c => c.startsWith('XSRF-TOKEN='));
-                        const xsrfToken = xsrfCookie
-                            ? decodeURIComponent(xsrfCookie.split('=')[1])
-                            : '';
-                        const r = await fetch('{api_path}', {{
-                            headers: {{
-                                'Accept': 'application/json, text/plain, */*',
-                                'Referer': '{BASE}/',
-                                'X-Requested-With': 'XMLHttpRequest',
-                                'X-XSRF-TOKEN': xsrfToken,
-                            }}
-                        }});
-                        if (!r.ok) return {{ _error: r.status, _xsrf: !!xsrfToken }};
-                        return await r.json();
-                    }} catch(e) {{
-                        return {{ _error: e.message }};
-                    }}
-                }}
-            """)
+            await page.goto(spa_url, wait_until="domcontentloaded", timeout=25_000)
+            # Ждём API-ответ от Angular (максимум 15 секунд)
+            try:
+                await asyncio.wait_for(capture_event.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: таймаут ожидания API")
         except Exception as e:
-            log.debug(f"Playwright eval '{keyword}' стр.{page_num}: {e}")
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: goto ошибка: {e}")
+
+        page.remove_listener("response", handle_response)
+
+        if not captured:
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: нет JSON-ответов — стоп")
             break
 
-        if not data or (isinstance(data, dict) and data.get("_error")):
-            log.debug(f"Playwright '{keyword}' стр.{page_num}: ошибка {data}")
-            break
-
-        items, total = _detect_items(data)
-        if not items:
-            log.debug(f"Playwright '{keyword}' стр.{page_num}: пусто (total={total})")
-            break
+        items, total = _detect_items(captured[0])
 
         new_items = []
         for item in items:
@@ -452,7 +458,7 @@ async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> lis
                 new_items.append(item)
 
         if not new_items:
-            log.debug(f"Playwright '{keyword}' стр.{page_num}: все дубли — стоп")
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: пусто или дубли — стоп")
             break
 
         results.extend(new_items)
@@ -567,19 +573,7 @@ async def _search_all_keywords_playwright(
                 await browser.close()
                 return {}
 
-        # Прогрев: навигация на SPA /encumbrances (нужна для Qrator-сессии)
-        log.info("Playwright: прогрев сессии (навигация на /encumbrances) ...")
-        try:
-            await page.goto(
-                BASE + "/encumbrances?searchString=antminer&group=all&period=%7B%7D&additionalFnpSearch=true&limit=15&offset=0",
-                wait_until="domcontentloaded",
-                timeout=20_000,
-            )
-            await asyncio.sleep(8)  # даём SPA загрузиться и сделать свои запросы
-        except Exception as e:
-            log.warning(f"Playwright warmup: {e}")
-
-        log.info(f"Playwright: сессия прогрета ({page.url}), обрабатываем {len(keywords)} ключевых слов")
+        log.info(f"Playwright: сессия готова ({page.url}), обрабатываем {len(keywords)} ключевых слов")
 
         for keyword in keywords:
             log.info(f"Playwright: поиск по '{keyword}'")
