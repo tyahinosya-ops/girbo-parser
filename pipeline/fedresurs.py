@@ -407,14 +407,21 @@ async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> lis
             data = await page.evaluate(f"""
                 async () => {{
                     try {{
+                        // Читаем XSRF-TOKEN из cookies (Angular CSRF-защита)
+                        const xsrfCookie = document.cookie.split('; ')
+                            .find(c => c.startsWith('XSRF-TOKEN='));
+                        const xsrfToken = xsrfCookie
+                            ? decodeURIComponent(xsrfCookie.split('=')[1])
+                            : '';
                         const r = await fetch('{api_path}', {{
                             headers: {{
                                 'Accept': 'application/json, text/plain, */*',
                                 'Referer': '{BASE}/',
                                 'X-Requested-With': 'XMLHttpRequest',
+                                'X-XSRF-TOKEN': xsrfToken,
                             }}
                         }});
-                        if (!r.ok) return {{ _error: r.status }};
+                        if (!r.ok) return {{ _error: r.status, _xsrf: !!xsrfToken }};
                         return await r.json();
                     }} catch(e) {{
                         return {{ _error: e.message }};
