@@ -26,25 +26,24 @@ INN_RE = re.compile(r"(?:ИНН|inn)[:\s]*(\d{10,12})", re.IGNORECASE)
 BASE = "https://fedresurs.ru"
 PAGE_SIZE = 40
 
-# Эндпоинты в порядке приоритета (метод, путь, параметр поиска)
-# /backend/sfacts → 404 с марта 2026. Добавлены /api/* кандидаты.
-FEDRESURS_ENDPOINTS: list[tuple[str, str, str]] = [
-    # /api/* — вероятные новые пути после переезда
-    ("GET",  "/api/sfacts",              "searchString"),
-    ("GET",  "/api/v1/sfacts",           "searchString"),
-    ("GET",  "/api/v2/sfacts",           "searchString"),
-    ("GET",  "/api/search",              "searchString"),
-    ("GET",  "/api/messages",            "searchString"),
-    ("GET",  "/api/sfacts",              "query"),
-    ("POST", "/api/sfacts/search",       "searchString"),
-    ("POST", "/api/sfacts",              "searchString"),
-    ("POST", "/api/search",              "searchString"),
-    # /backend/* — старые пути (были рабочими до марта 2026)
-    ("GET",  "/backend/sfacts",          "searchString"),
-    ("GET",  "/backend/search",          "searchString"),
-    ("GET",  "/backend/messages",        "searchString"),
-    ("POST", "/backend/sfacts/search",   "searchString"),
-    ("POST", "/backend/sfacts",          "searchString"),
+# Эндпоинты в порядке приоритета: (метод, путь, параметр_поиска, доп_параметры)
+# /encumbrances — актуальный эндпоинт (найден 19 марта 2026 через DevTools)
+# /backend/sfacts — 404 с марта 2026
+FEDRESURS_ENDPOINTS: list[tuple[str, str, str, dict]] = [
+    ("GET", "/encumbrances", "searchString", {
+        "group": "all",
+        "period": "{}",
+        "additionalFnpSearch": "true",
+    }),
+    # Резервные варианты
+    ("GET",  "/api/sfacts",            "searchString", {}),
+    ("GET",  "/api/v1/sfacts",         "searchString", {}),
+    ("GET",  "/api/search",            "searchString", {}),
+    ("POST", "/api/sfacts/search",     "searchString", {}),
+    # Старые пути (до марта 2026)
+    ("GET",  "/backend/sfacts",        "searchString", {}),
+    ("GET",  "/backend/search",        "searchString", {}),
+    ("POST", "/backend/sfacts",        "searchString", {}),
 ]
 
 LEASING_MESSAGE_TYPES = [
@@ -236,24 +235,24 @@ def classify_lessor(okved: str, name: str) -> str:
 
 async def _probe_endpoints(
     client: httpx.AsyncClient, xsrf: str
-) -> tuple[str, str, str] | None:
+) -> tuple[str, str, str, dict] | None:
     """
-    Перебирает эндпоинты, возвращает первый рабочий (метод, путь, параметр).
+    Перебирает эндпоинты, возвращает первый рабочий (метод, путь, параметр, доп_параметры).
     """
-    for method, path, param in FEDRESURS_ENDPOINTS:
+    for method, path, param, extra in FEDRESURS_ENDPOINTS:
         url = BASE + path
         try:
             if method == "GET":
                 r = await client.get(
                     url,
-                    params={"limit": 1, "offset": 0, param: "лизинг"},
+                    params={"limit": 1, "offset": 0, param: "лизинг", **extra},
                     headers=_headers(xsrf),
                     timeout=20,
                 )
             else:
                 r = await client.post(
                     url,
-                    json={"limit": 1, "offset": 0, param: "лизинг"},
+                    json={"limit": 1, "offset": 0, param: "лизинг", **extra},
                     headers={**_headers(xsrf), "Content-Type": "application/json"},
                     timeout=20,
                 )
@@ -265,7 +264,7 @@ async def _probe_endpoints(
                 items, total = _detect_items(data)
                 if items or total:
                     log.info(f"Федресурс: рабочий эндпоинт {method} {path} ?{param}")
-                    return method, path, param
+                    return method, path, param, extra
             except Exception:
                 continue
         except Exception as e:
@@ -284,6 +283,7 @@ async def _fetch_pages(
     path: str,
     param: str,
     xsrf: str,
+    extra: dict | None = None,
     max_pages: int = 50,
 ) -> list[dict]:
     """
@@ -294,6 +294,7 @@ async def _fetch_pages(
     seen_ids: set = set()
     offset = 0
     url = BASE + path
+    extra = extra or {}
 
     for page_num in range(max_pages):
         for attempt in range(MAX_RETRIES):
@@ -301,14 +302,14 @@ async def _fetch_pages(
                 if method == "GET":
                     r = await client.get(
                         url,
-                        params={"limit": PAGE_SIZE, "offset": offset, param: query},
+                        params={"limit": PAGE_SIZE, "offset": offset, param: query, **extra},
                         headers=_headers(xsrf),
                         timeout=25,
                     )
                 else:
                     r = await client.post(
                         url,
-                        json={"limit": PAGE_SIZE, "offset": offset, param: query},
+                        json={"limit": PAGE_SIZE, "offset": offset, param: query, **extra},
                         headers={**_headers(xsrf), "Content-Type": "application/json"},
                         timeout=25,
                     )
@@ -412,14 +413,14 @@ async def search_by_keywords(
                 "error":        "no_endpoint",
             }
 
-        method, path, param = endpoint
+        method, path, param, extra = endpoint
         log.info(f"Федресурс: используем эндпоинт {method} {path} ?{param}")
 
         for keyword in keywords:
             log.info(f"Федресурс: поиск по '{keyword}'")
             stats["keywords_searched"] += 1
 
-            items = await _fetch_pages(client, keyword, method, path, param, xsrf)
+            items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
             stats["contracts_found"] += len(items)
 
             for item in items:
@@ -524,8 +525,8 @@ async def fetch_fedresurs(inn: str) -> dict[str, Any]:
         xsrf = await _init_session(client)
         endpoint = await _probe_endpoints(client, xsrf)
         if endpoint:
-            method, path, param = endpoint
-            items = await _fetch_pages(client, inn, method, path, param, xsrf)
+            method, path, param, extra = endpoint
+            items = await _fetch_pages(client, inn, method, path, param, xsrf, extra)
             result["raw_count"] = len(items)
             result["leasing_texts"] = [
                 _extract_leasing_text(i) for i in items
