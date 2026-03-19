@@ -422,43 +422,83 @@ async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dic
             await browser.close()
             return []
 
-        log.info(f"Playwright: страница загружена ({page.url}), начинаем fetch-цикл")
+        log.info(f"Playwright: страница загружена ({page.url}), начинаем перехват API")
 
-        offset = 0
         seen_ids: set = set()
 
-        for page_num in range(max_pages):
-            api_path = (
-                f"/encumbrances"
-                f"?searchString={keyword}"
-                f"&group=all&period=%7B%7D&additionalFnpSearch=true"
-                f"&limit={PAGE_SIZE}&offset={offset}"
-            )
+        # /encumbrances — это SPA-роут, реальный API вызывается браузером.
+        # Перехватываем JSON-ответы и параллельно пробуем backend-пути напрямую.
+        intercepted: list[dict] = []
+        real_api_url: list[str] = []  # обнаруженный backend-URL
+
+        async def _on_response(response):
+            url = response.url
+            if "fedresurs.ru" not in url:
+                return
+            skip = (".js", ".css", ".png", ".woff", ".ico", "yandex", "favicon",
+                    "settings", "clientApp", "yandexMetrics")
+            if any(s in url for s in skip):
+                return
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
             try:
-                data = await page.evaluate(f"""
-                    async () => {{
-                        try {{
-                            const r = await fetch('{api_path}', {{
-                                headers: {{
-                                    'Accept': 'application/json, text/plain, */*',
-                                    'X-Requested-With': 'XMLHttpRequest',
-                                    'Referer': '{BASE}/',
-                                }}
-                            }});
-                            if (!r.ok) return {{ _error: r.status }};
-                            return r.json();
-                        }} catch(e) {{ return {{ _error: e.message }}; }}
-                    }}
-                """)
+                body = await response.json()
+                items, total = _detect_items(body)
+                if items or total:
+                    intercepted.append(body)
+                    if not real_api_url:
+                        # Запоминаем путь без query-параметров для повторных запросов
+                        from urllib.parse import urlparse
+                        parsed = urlparse(url)
+                        real_api_url.append(parsed.path)
+                        log.info(f"Playwright: обнаружен backend API → {parsed.path}")
+            except Exception:
+                pass
 
-                if not data or (isinstance(data, dict) and data.get("_error")):
-                    log.debug(f"Playwright '{keyword}' стр.{page_num}: {data}")
+        page.on("response", _on_response)
+
+        for page_num in range(max_pages):
+            # Первая страница — навигация на encumbrances (SPA загрузит данные сама)
+            if page_num == 0:
+                import urllib.parse
+                kw_enc = urllib.parse.quote(keyword)
+                nav_url = (
+                    f"{BASE}/encumbrances"
+                    f"?searchString={kw_enc}"
+                    f"&group=all&period=%7B%7D&additionalFnpSearch=true"
+                    f"&limit={PAGE_SIZE}&offset=0"
+                )
+                try:
+                    await page.goto(nav_url, wait_until="networkidle", timeout=20_000)
+                except Exception:
+                    await asyncio.sleep(3)
+            else:
+                # Последующие страницы — меняем offset через URL
+                if not real_api_url:
                     break
+                import urllib.parse
+                kw_enc = urllib.parse.quote(keyword)
+                offset = page_num * PAGE_SIZE
+                nav_url = (
+                    f"{BASE}/encumbrances"
+                    f"?searchString={kw_enc}"
+                    f"&group=all&period=%7B%7D&additionalFnpSearch=true"
+                    f"&limit={PAGE_SIZE}&offset={offset}"
+                )
+                try:
+                    await page.goto(nav_url, wait_until="networkidle", timeout=20_000)
+                except Exception:
+                    await asyncio.sleep(3)
 
-                items, total = _detect_items(data)
-                if not items:
-                    break
+            await asyncio.sleep(2)
 
+            if not intercepted:
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: нет JSON-ответов")
+                break
+
+            for body in intercepted:
+                items, total = _detect_items(body)
                 new_items = []
                 for item in items:
                     item_id = (
@@ -469,25 +509,17 @@ async def _fetch_pages_playwright(keyword: str, max_pages: int = 50) -> list[dic
                     if item_id not in seen_ids:
                         seen_ids.add(item_id)
                         new_items.append(item)
-
-                if not new_items:
-                    break
-
                 results.extend(new_items)
-                log.debug(
-                    f"Playwright '{keyword}': стр.{page_num} "
-                    f"+{len(new_items)} (всего {len(results)})"
-                )
-                offset += PAGE_SIZE
-                if total and offset >= total:
-                    break
+                if new_items:
+                    log.debug(
+                        f"Playwright '{keyword}': стр.{page_num} "
+                        f"+{len(new_items)} (всего {len(results)})"
+                    )
+            intercepted.clear()
 
-                await asyncio.sleep(_rand_delay())
+            await asyncio.sleep(_rand_delay())
 
-            except Exception as e:
-                log.debug(f"Playwright '{keyword}' стр.{page_num}: {e}")
-                break
-
+        page.remove_listener("response", _on_response)
         await browser.close()
 
     return results
