@@ -474,6 +474,10 @@ async def _search_all_keywords_playwright(
 ) -> dict[str, list[dict]]:
     """
     Один браузер — один Qrator-challenge — все ключевые слова.
+    Стратегии (по приоритету):
+      1. CDP — подключаемся к уже запущенному Chrome (localhost:9222)
+      2. channel="chrome" — запускаем установленный Google Chrome
+      3. Chromium + stealth — запасной вариант
     Возвращает {keyword: [items...]}.
     """
     try:
@@ -482,52 +486,88 @@ async def _search_all_keywords_playwright(
         log.error("playwright не установлен")
         return {}
 
-    from config import PLAYWRIGHT_HEADLESS
-
     result: dict[str, list[dict]] = {}
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=PLAYWRIGHT_HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-            ],
-        )
-        context = await browser.new_context(
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            user_agent=random.choice(USER_AGENTS),
-            viewport={"width": 1280, "height": 800},
-            extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9"},
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru']});
-            window.chrome = { runtime: {} };
-        """)
+        browser = None
+        context = None
+        via_cdp = False
+
+        # ── Стратегия 1: подключение к уже запущенному Chrome (CDP) ──────────
+        try:
+            browser = await pw.chromium.connect_over_cdp("http://localhost:9222", timeout=3_000)
+            contexts = browser.contexts
+            context = contexts[0] if contexts else await browser.new_context()
+            via_cdp = True
+            log.info("Playwright: подключились к реальному Chrome через CDP (порт 9222)")
+        except Exception:
+            browser = None
+
+        # ── Стратегия 2: запуск установленного Google Chrome ─────────────────
+        if not browser:
+            try:
+                browser = await pw.chromium.launch(
+                    headless=False,
+                    channel="chrome",   # реальный Chrome, не Chromium
+                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                )
+                context = await browser.new_context(
+                    locale="ru-RU", timezone_id="Europe/Moscow",
+                    user_agent=random.choice(USER_AGENTS),
+                    viewport={"width": 1280, "height": 800},
+                )
+                log.info("Playwright: запущен реальный Google Chrome (channel=chrome)")
+            except Exception as e:
+                log.debug(f"Playwright channel=chrome недоступен: {e}")
+                browser = None
+
+        # ── Стратегия 3: Chromium со stealth-настройками ─────────────────────
+        if not browser:
+            browser = await pw.chromium.launch(
+                headless=False,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-extensions",
+                ],
+            )
+            context = await browser.new_context(
+                locale="ru-RU", timezone_id="Europe/Moscow",
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9"},
+            )
+            log.info("Playwright: запущен Chromium (stealth mode)")
+
+        # Stealth init-script (для стратегий 2 и 3)
+        if not via_cdp:
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru']});
+                window.chrome = { runtime: {} };
+            """)
+
         page = await context.new_page()
 
-        # Шаг 1: главная страница — Qrator PoW-challenge
-        log.info(f"Playwright: загружаем {BASE}/ (Qrator challenge) ...")
-        try:
-            await page.goto(BASE + "/", wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(5)
-        except Exception as e:
-            log.warning(f"Playwright homepage: {e}")
-            await browser.close()
-            return {}
+        # Прогрев: если не CDP — нужно пройти Qrator с нуля
+        if not via_cdp:
+            log.info(f"Playwright: загружаем {BASE}/ (Qrator challenge) ...")
+            try:
+                await page.goto(BASE + "/", wait_until="domcontentloaded", timeout=30_000)
+                await asyncio.sleep(5)
+            except Exception as e:
+                log.warning(f"Playwright homepage: {e}")
+                await browser.close()
+                return {}
 
-        if "qrerror" in page.url or "403" in str(page.url):
-            log.warning("Playwright: Qrator вернул 403 — нужна residential прокси")
-            await browser.close()
-            return {}
+            if "qrerror" in page.url or "403" in str(page.url):
+                log.warning("Playwright: Qrator вернул 403")
+                await browser.close()
+                return {}
 
-        # Шаг 2: прогрев — навигация на SPA /encumbrances
-        # Qrator проверяет историю навигации перед разрешением API-запросов
+        # Прогрев: навигация на SPA /encumbrances (нужна для Qrator-сессии)
         log.info("Playwright: прогрев сессии (навигация на /encumbrances) ...")
         try:
             await page.goto(
