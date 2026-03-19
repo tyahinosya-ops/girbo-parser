@@ -388,10 +388,9 @@ async def _fetch_pages(
 
 async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> list[dict]:
     """
-    Navigate-and-intercept: навигируем на SPA-страницу и перехватываем
-    естественный XHR-вызов Angular → /backend/encumbrances.
-    Этот подход работает (подтверждён intercept_log.json).
-    page.evaluate(fetch(...)) блокируется Qrator, а SPA-запрос — нет.
+    Navigate-and-intercept через page.expect_response() — правильный Playwright-паттерн.
+    Angular-SPA сама вызывает /backend/encumbrances при навигации на /encumbrances?searchString=...
+    Это подтверждено intercept_log.json: antminer → реальные лизинговые данные.
     """
     import urllib.parse
     kw_enc = urllib.parse.quote(keyword)
@@ -401,27 +400,6 @@ async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> lis
     for page_num in range(max_pages):
         offset = page_num * PAGE_SIZE
 
-        # Готовим перехват до навигации
-        captured: list[dict] = []
-        capture_event = asyncio.Event()
-
-        async def handle_response(response: Any) -> None:
-            if (
-                "/backend/encumbrances" in response.url
-                and "searchString=" in response.url
-                and response.status == 200
-                and not captured  # берём только первый ответ
-            ):
-                try:
-                    data = await response.json()
-                    if isinstance(data, dict) and "pageData" in data:
-                        captured.append(data)
-                        capture_event.set()
-                except Exception:
-                    pass
-
-        page.on("response", handle_response)
-
         spa_url = (
             f"{BASE}/encumbrances"
             f"?searchString={kw_enc}"
@@ -429,23 +407,37 @@ async def _pw_fetch_keyword(page: Any, keyword: str, max_pages: int = 50) -> lis
             f"&limit={PAGE_SIZE}&offset={offset}"
         )
 
+        data: dict | None = None
         try:
-            await page.goto(spa_url, wait_until="domcontentloaded", timeout=25_000)
-            # Ждём API-ответ от Angular (максимум 15 секунд)
-            try:
-                await asyncio.wait_for(capture_event.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                log.debug(f"Playwright '{keyword}' стр.{page_num}: таймаут ожидания API")
+            # expect_response ставим ДО goto — это правильный Playwright-паттерн
+            async with page.expect_response(
+                lambda r: (
+                    "/backend/encumbrances" in r.url
+                    and "searchString=" in r.url
+                ),
+                timeout=25_000,
+            ) as resp_info:
+                await page.goto(spa_url, wait_until="domcontentloaded", timeout=25_000)
+
+            response = await resp_info.value
+            log.debug(
+                f"Playwright '{keyword}' стр.{page_num}: "
+                f"перехвачен {response.url} → HTTP {response.status}"
+            )
+            if response.status == 200:
+                data = await response.json()
+            else:
+                log.debug(f"Playwright '{keyword}' стр.{page_num}: API вернул {response.status}")
+                break
+
         except Exception as e:
-            log.debug(f"Playwright '{keyword}' стр.{page_num}: goto ошибка: {e}")
-
-        page.remove_listener("response", handle_response)
-
-        if not captured:
-            log.debug(f"Playwright '{keyword}' стр.{page_num}: нет JSON-ответов — стоп")
+            log.debug(f"Playwright '{keyword}' стр.{page_num}: {e}")
             break
 
-        items, total = _detect_items(captured[0])
+        if not data:
+            break
+
+        items, total = _detect_items(data)
 
         new_items = []
         for item in items:
