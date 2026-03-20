@@ -745,7 +745,8 @@ async def search_by_keywords(
 
     # ── Стратегия 1: httpx с Client Hints (sec-ch-ua) ────────────────────────
     # Qrator пропускает запросы с правильными Client Hints без cookies/Playwright
-    missing_after_cookies = [kw for kw in keywords if not keyword_items.get(kw)]
+    # Используем kw not in keyword_items — [] тоже считается обработанным
+    missing_after_cookies = [kw for kw in keywords if kw not in keyword_items]
     if missing_after_cookies:
         transport = _make_transport()
         async with httpx.AsyncClient(
@@ -772,6 +773,9 @@ async def search_by_keywords(
                             "GET", "/backend/encumbrances", "searchString", xsrf="",
                         )
                         keyword_items[keyword] = items
+                        log.info(f"Федресурс httpx '{keyword}': {len(items)} записей")
+                        # Пауза между ключевыми словами — снижает риск rate-limit
+                        await asyncio.sleep(random.uniform(2.0, 4.0))
                 else:
                     log.info(f"Федресурс httpx: {probe.status_code} → Playwright")
             except Exception as e:
