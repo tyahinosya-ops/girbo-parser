@@ -559,7 +559,7 @@ async def _search_all_keywords_playwright(
 
         # ── Стратегия 1: подключение к уже запущенному Chrome (CDP) ──────────
         try:
-            browser = await pw.chromium.connect_over_cdp("http://localhost:9222", timeout=3_000)
+            browser = await pw.chromium.connect_over_cdp("http://localhost:9222", timeout=10_000)
             contexts = browser.contexts
             context = contexts[0] if contexts else await browser.new_context()
             via_cdp = True
