@@ -75,13 +75,18 @@ def _rand_delay() -> float:
 
 
 def _headers(xsrf: str = "") -> dict:
+    # sec-ch-ua Client Hints — ключ к обходу Qrator (подтверждено DevTools 20.03.2026)
+    # Без них httpx получает 451, с ними — 200 (как реальный Chrome)
     h = {
-        "User-Agent":      random.choice(USER_AGENTS),
-        "Accept":          "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer":         BASE + "/",
-        "Origin":          BASE,
-        "Connection":      "keep-alive",
+        "User-Agent":        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Accept":            "application/json, text/plain, */*",
+        "Accept-Language":   "ru-RU,ru;q=0.9",
+        "Referer":           BASE + "/encumbrances",
+        "sec-ch-ua":         '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "sec-ch-ua-mobile":  "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Cache-Control":     "no-cache",
+        "Pragma":            "no-cache",
     }
     if xsrf:
         h["X-XSRF-TOKEN"]     = xsrf
@@ -715,7 +720,8 @@ async def search_by_keywords(
             keyword_items.update(kw_result)
             log.info(f"Федресурс: Chrome cookies сработали ({len(kw_result)} ключевых слов)")
 
-    # ── Стратегия 1: httpx с прокси или без ──────────────────────────────────
+    # ── Стратегия 1: httpx с Client Hints (sec-ch-ua) ────────────────────────
+    # Qrator пропускает запросы с правильными Client Hints без cookies/Playwright
     missing_after_cookies = [kw for kw in keywords if not keyword_items.get(kw)]
     if missing_after_cookies:
         transport = _make_transport()
@@ -724,18 +730,28 @@ async def search_by_keywords(
             timeout=httpx.Timeout(25.0),
             follow_redirects=True,
         ) as client:
-            xsrf = await _init_session(client)
-            endpoint = await _probe_endpoints(client, xsrf)
-
-            if endpoint:
-                method, path, param, extra = endpoint
-                log.info(f"Федресурс: httpx работает → {method} {path}")
-                for keyword in missing_after_cookies:
-                    log.info(f"Федресурс httpx: поиск по '{keyword}'")
-                    items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
-                    keyword_items[keyword] = items
-            else:
-                log.info("Федресурс: httpx недоступен (Qrator 451/404) → Playwright")
+            # Проверяем что Client Hints работают
+            try:
+                probe = await client.get(
+                    BASE + "/backend/encumbrances",
+                    params={"limit": 1, "offset": 0},
+                    headers=_headers(),
+                    timeout=10,
+                )
+                log.info(f"Федресурс httpx probe (Client Hints): HTTP {probe.status_code}")
+                if probe.status_code == 200:
+                    log.info("Федресурс: httpx работает с Client Hints!")
+                    for keyword in missing_after_cookies:
+                        log.info(f"Федресурс httpx: поиск по '{keyword}'")
+                        items = await _fetch_pages(
+                            client, keyword,
+                            "GET", "/backend/encumbrances", "searchString", xsrf="",
+                        )
+                        keyword_items[keyword] = items
+                else:
+                    log.info(f"Федресурс httpx: {probe.status_code} → Playwright")
+            except Exception as e:
+                log.debug(f"Федресурс httpx probe: {e}")
 
     # ── Стратегия 2: Playwright (один браузер, navigate-and-intercept) ────────
     missing = [kw for kw in keywords if not keyword_items.get(kw)]
