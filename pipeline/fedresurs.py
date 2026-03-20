@@ -75,18 +75,22 @@ def _rand_delay() -> float:
 
 
 def _headers(xsrf: str = "") -> dict:
-    # sec-ch-ua Client Hints — ключ к обходу Qrator (подтверждено DevTools 20.03.2026)
-    # Без них httpx получает 451, с ними — 200 (как реальный Chrome)
+    # sec-ch-ua Client Hints + Sec-Fetch-* + HTTP/1.1 — ключ к обходу Qrator
+    # Подтверждено test_fedresurs.py 20.03.2026: HTTP 200, found=153 для antminer
     h = {
-        "User-Agent":        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        "Accept":            "application/json, text/plain, */*",
-        "Accept-Language":   "ru-RU,ru;q=0.9",
-        "Referer":           BASE + "/encumbrances",
-        "sec-ch-ua":         '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-        "sec-ch-ua-mobile":  "?0",
+        "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Accept":             "application/json, text/plain, */*",
+        "Accept-Language":    "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer":            BASE + "/encumbrances",
+        "Origin":             BASE,
+        "sec-ch-ua":          '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "sec-ch-ua-mobile":   "?0",
         "sec-ch-ua-platform": '"Windows"',
-        "Cache-Control":     "no-cache",
-        "Pragma":            "no-cache",
+        "Sec-Fetch-Site":     "same-origin",
+        "Sec-Fetch-Mode":     "cors",
+        "Sec-Fetch-Dest":     "empty",
+        "Cache-Control":      "no-cache",
+        "Pragma":             "no-cache",
     }
     if xsrf:
         h["X-XSRF-TOKEN"]     = xsrf
@@ -176,7 +180,16 @@ def _extract_lessee_inn(item: dict) -> str:
 
 
 def _extract_lessor_inn(item: dict) -> str:
-    """ИНН лизингодателя (ПУТЬ Б — хостинги)."""
+    """ИНН лизингодателя (ПУТЬ Б — хостинги).
+    Новая структура: strongSide[{role: 'Lessor', inn: '...'}]
+    """
+    # strongSide — основная сторона договора (Lessor / Creditor)
+    for party in item.get("strongSide", []):
+        if not party.get("isHidden", False):
+            inn = str(party.get("inn", "")).strip()
+            if re.fullmatch(r"\d{10,12}", inn):
+                return inn
+    # Fallback: weakSide с ролью лизингодателя
     for party in item.get("weakSide", []):
         if party.get("role") in _LESSOR_ROLES and not party.get("isHidden", False):
             inn = str(party.get("inn", "")).strip()
@@ -188,14 +201,23 @@ def _extract_lessor_inn(item: dict) -> str:
 
 
 def _extract_lessor_meta(item: dict) -> tuple[str, str]:
-    """Возвращает (ИНН лизингодателя, название лизингодателя)."""
+    """Возвращает (ИНН лизингодателя, название лизингодателя).
+    Новая структура: strongSide[{role: 'Lessor', inn: '...', name: '...'}]
+    """
+    # strongSide — основная сторона (Lessor)
+    for party in item.get("strongSide", []):
+        if not party.get("isHidden", False):
+            inn = str(party.get("inn", "")).strip()
+            name = str(party.get("name", "")).strip()
+            if re.fullmatch(r"\d{10,12}", inn):
+                return inn, name
+    # Fallback: weakSide с ролью лизингодателя
     for party in item.get("weakSide", []):
         if party.get("role") in _LESSOR_ROLES and not party.get("isHidden", False):
             inn = str(party.get("inn", "")).strip()
             name = str(party.get("name", "")).strip()
             if re.fullmatch(r"\d{10,12}", inn):
                 return inn, name
-    # Fallback
     inn = _extract_lessor_inn(item)
     name = str(item.get(
         "lessorName", item.get("creditorName", item.get("counterpartyName", ""))
@@ -319,6 +341,7 @@ async def _fetch_pages_with_cookies(
         transport=transport,
         timeout=httpx.Timeout(25.0),
         follow_redirects=True,
+        http2=False,
     ) as client:
         # Проверочный запрос
         try:
@@ -729,6 +752,7 @@ async def search_by_keywords(
             transport=transport,
             timeout=httpx.Timeout(25.0),
             follow_redirects=True,
+            http2=False,
         ) as client:
             # Проверяем что Client Hints работают
             try:
@@ -754,7 +778,8 @@ async def search_by_keywords(
                 log.debug(f"Федресурс httpx probe: {e}")
 
     # ── Стратегия 2: Playwright (один браузер, navigate-and-intercept) ────────
-    missing = [kw for kw in keywords if not keyword_items.get(kw)]
+    # kw not in keyword_items: только НЕ обработанные ([], тоже считается обработанным)
+    missing = [kw for kw in keywords if kw not in keyword_items]
     if missing:
         log.info(f"Федресурс: Playwright для {len(missing)} ключевых слов")
         pw_results = await _search_all_keywords_playwright(missing)
@@ -768,11 +793,16 @@ async def search_by_keywords(
 
         for item in items:
                 msg_type = str(item.get("messageType", item.get("type", ""))).lower()
+                # Принимаем все типы договоров с лизингом/залогом/арендой
+                # "ChangeFinancialLeaseContract2", "StartFinancialLeaseContract", etc.
                 is_leasing = (
-                    "лизинг" in msg_type
+                    "lease" in msg_type       # ChangeFinancialLeaseContract2, etc.
+                    or "лизинг" in msg_type
                     or "leasing" in msg_type
                     or "аренда" in msg_type
-                    or not msg_type  # тип неизвестен — берём всё
+                    or "pledge" in msg_type   # залоги тоже учитываем
+                    or "залог" in msg_type
+                    or not msg_type           # тип неизвестен — берём всё
                 )
                 if not is_leasing:
                     continue
@@ -862,6 +892,7 @@ async def fetch_fedresurs(inn: str) -> dict[str, Any]:
         transport=transport,
         timeout=httpx.Timeout(25.0),
         follow_redirects=True,
+        http2=False,
     ) as client:
         xsrf = await _init_session(client)
         endpoint = await _probe_endpoints(client, xsrf)
