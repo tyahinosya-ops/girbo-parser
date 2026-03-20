@@ -253,6 +253,72 @@ def classify_lessor(okved: str, name: str) -> str:
     return "other"
 
 
+def _get_chrome_cookies() -> dict:
+    """
+    Читает cookies fedresurs.ru из реального Chrome.
+    Требует: browser-cookie3, Chrome открыт и был на fedresurs.ru.
+    Возвращает все cookies включая Qrator-сессию и XSRF-TOKEN.
+    """
+    try:
+        import browser_cookie3
+        jar = browser_cookie3.chrome(domain_name="fedresurs.ru")
+        cookies = {c.name: c.value for c in jar}
+        if cookies:
+            has_xsrf = "XSRF-TOKEN" in cookies
+            log.debug(f"Chrome cookies fedresurs.ru: {list(cookies.keys())} XSRF={'да' if has_xsrf else 'нет'}")
+        return cookies
+    except Exception as e:
+        log.debug(f"browser_cookie3: {e}")
+        return {}
+
+
+async def _fetch_pages_with_cookies(
+    cookies: dict, keywords: list[str], max_pages: int = 50
+) -> dict[str, list[dict]]:
+    """
+    Использует cookies из Chrome для httpx-запросов к /backend/encumbrances.
+    Qrator пропускает запросы с валидными сессионными cookies.
+    """
+    xsrf = cookies.get("XSRF-TOKEN", "")
+    result: dict[str, list[dict]] = {}
+
+    transport = _make_transport()
+    async with httpx.AsyncClient(
+        cookies=cookies,
+        transport=transport,
+        timeout=httpx.Timeout(25.0),
+        follow_redirects=True,
+    ) as client:
+        # Проверочный запрос
+        try:
+            r = await client.get(
+                BASE + "/backend/encumbrances",
+                params={"searchString": "antminer", "limit": 1, "offset": 0},
+                headers=_headers(xsrf),
+                timeout=10,
+            )
+            log.info(f"Федресурс Chrome-cookies probe: HTTP {r.status_code}")
+            if r.status_code != 200:
+                log.warning(f"Chrome cookies не работают (HTTP {r.status_code}) — cookies устарели?")
+                return {}
+        except Exception as e:
+            log.debug(f"Chrome-cookies probe: {e}")
+            return {}
+
+        for keyword in keywords:
+            log.info(f"Федресурс Chrome-cookies: поиск по '{keyword}'")
+            items = await _fetch_pages(
+                client, keyword,
+                "GET", "/backend/encumbrances", "searchString", xsrf,
+                max_pages=max_pages,
+            )
+            result[keyword] = items
+            log.info(f"Федресурс Chrome-cookies '{keyword}': {len(items)} записей")
+            await asyncio.sleep(_rand_delay())
+
+    return result
+
+
 async def _probe_endpoints(
     client: httpx.AsyncClient, xsrf: str
 ) -> tuple[str, str, str, dict] | None:
@@ -611,35 +677,41 @@ async def search_by_keywords(
         "lessors_accepted":    0,
     }
 
-    # Пробуем httpx (быстро, если есть прокси или не заблокирован)
-    # При блокировке (451/403/no_endpoint) — один Playwright-браузер на все ключевые слова
-    transport = _make_transport()
     keyword_items: dict[str, list[dict]] = {}  # keyword → items
 
-    async with httpx.AsyncClient(
-        transport=transport,
-        timeout=httpx.Timeout(25.0),
-        follow_redirects=True,
-    ) as client:
+    # ── Стратегия 0: cookies из реального Chrome (самая надёжная) ────────────
+    # Qrator не блокирует запросы с cookies реального Chrome
+    chrome_cookies = _get_chrome_cookies()
+    if chrome_cookies:
+        log.info("Федресурс: найдены Chrome cookies → пробуем без Playwright")
+        kw_result = await _fetch_pages_with_cookies(chrome_cookies, keywords)
+        if kw_result:
+            keyword_items.update(kw_result)
+            log.info(f"Федресурс: Chrome cookies сработали ({len(kw_result)} ключевых слов)")
 
-        xsrf = await _init_session(client)
-        endpoint = await _probe_endpoints(client, xsrf)
+    # ── Стратегия 1: httpx с прокси или без ──────────────────────────────────
+    missing_after_cookies = [kw for kw in keywords if not keyword_items.get(kw)]
+    if missing_after_cookies:
+        transport = _make_transport()
+        async with httpx.AsyncClient(
+            transport=transport,
+            timeout=httpx.Timeout(25.0),
+            follow_redirects=True,
+        ) as client:
+            xsrf = await _init_session(client)
+            endpoint = await _probe_endpoints(client, xsrf)
 
-        if endpoint:
-            method, path, param, extra = endpoint
-            log.info(f"Федресурс: httpx работает → {method} {path}")
-            blocked = False
-            for keyword in keywords:
-                if blocked:
-                    break
-                log.info(f"Федресурс httpx: поиск по '{keyword}'")
-                items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
-                # Если вернулось пусто — возможно, блокировка началась в процессе
-                keyword_items[keyword] = items
-        else:
-            log.info("Федресурс: httpx недоступен (Qrator 451/404) → Playwright")
+            if endpoint:
+                method, path, param, extra = endpoint
+                log.info(f"Федресурс: httpx работает → {method} {path}")
+                for keyword in missing_after_cookies:
+                    log.info(f"Федресурс httpx: поиск по '{keyword}'")
+                    items = await _fetch_pages(client, keyword, method, path, param, xsrf, extra)
+                    keyword_items[keyword] = items
+            else:
+                log.info("Федресурс: httpx недоступен (Qrator 451/404) → Playwright")
 
-    # Ключевые слова без результатов — через Playwright
+    # ── Стратегия 2: Playwright (один браузер, navigate-and-intercept) ────────
     missing = [kw for kw in keywords if not keyword_items.get(kw)]
     if missing:
         log.info(f"Федресурс: Playwright для {len(missing)} ключевых слов")
