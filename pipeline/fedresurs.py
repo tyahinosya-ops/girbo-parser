@@ -255,17 +255,43 @@ def classify_lessor(okved: str, name: str) -> str:
 
 def _get_chrome_cookies() -> dict:
     """
-    Читает cookies fedresurs.ru из реального Chrome.
-    Требует: browser-cookie3, Chrome открыт и был на fedresurs.ru.
-    Возвращает все cookies включая Qrator-сессию и XSRF-TOKEN.
+    Читает cookies fedresurs.ru из двух источников (приоритет — файл):
+      1. chrome_session.json — сохранён через save_chrome_session.py (надёжнее)
+      2. browser-cookie3     — читает из Chrome напрямую (Chrome должен быть закрыт)
     """
+    import pathlib
+
+    # Источник 1: chrome_session.json (сохранён через save_chrome_session.py)
+    session_file = pathlib.Path("chrome_session.json")
+    if session_file.exists():
+        try:
+            import json
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+            cookies = data.get("cookies", {})
+            saved_headers = data.get("headers", {})
+            if cookies:
+                # Добавляем XSRF из заголовков если есть
+                if "X-XSRF-TOKEN" in saved_headers and "XSRF-TOKEN" not in cookies:
+                    cookies["XSRF-TOKEN"] = saved_headers["X-XSRF-TOKEN"]
+                log.info(
+                    f"Федресурс: загружена сессия из chrome_session.json "
+                    f"({len(cookies)} cookies, XSRF={'да' if 'XSRF-TOKEN' in cookies else 'нет'})"
+                )
+                return cookies
+        except Exception as e:
+            log.debug(f"chrome_session.json: {e}")
+
+    # Источник 2: browser-cookie3 (Chrome должен быть закрыт)
     try:
         import browser_cookie3
         jar = browser_cookie3.chrome(domain_name="fedresurs.ru")
         cookies = {c.name: c.value for c in jar}
         if cookies:
             has_xsrf = "XSRF-TOKEN" in cookies
-            log.debug(f"Chrome cookies fedresurs.ru: {list(cookies.keys())} XSRF={'да' if has_xsrf else 'нет'}")
+            log.info(
+                f"Федресурс: Chrome cookies через browser-cookie3 "
+                f"({len(cookies)} шт, XSRF={'да' if has_xsrf else 'нет'})"
+            )
         return cookies
     except Exception as e:
         log.debug(f"browser_cookie3: {e}")
